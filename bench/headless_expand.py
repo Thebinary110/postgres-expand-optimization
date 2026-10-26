@@ -12,6 +12,7 @@ Credentials come from the environment (never from arguments):
   python bench/headless_expand.py --database kaggle_challenge --report out.txt
 """
 import argparse
+import inspect
 import json
 import os
 import socket
@@ -78,7 +79,7 @@ def main():
     service.ensure_control_database()
     service.ensure_remote_admin_dirs()
     service.ensure_admin_schema()
-    for item in service.recover_pending_expansions():
+    for item in (service.recover_pending_expansions() if hasattr(service, "recover_pending_expansions") else []):
         print(f"recovered pending expansion {item['job_id']} in {item['database_name']}", flush=True)
     if args.recover_only:
         service.close()
@@ -91,12 +92,15 @@ def main():
 
     report = service.create_cross_table_expansion_timing_report(
         args.database, args.source, raw_schemas, [d["table_name"] for d in destinations])
-    with service.expansion_timing_scope(report, "prepare", "Ensure control database metadata"):
-        service.ensure_admin_schema(cancel_event=None)
+    if not getattr(service, "batched_preflight_enabled", lambda: False)():
+        with service.expansion_timing_scope(report, "prepare", "Ensure control database metadata"):
+            service.ensure_admin_schema(cancel_event=None)
+    extra = {}
+    if "job_context" in inspect.signature(service.execute_cross_table_expansion).parameters:
+        extra["job_context"] = {"requested_by": args.author, "workstation_name": socket.gethostname()}
     result = service.execute_cross_table_expansion(
         database_name=args.database, source_full_table_name=args.source, raw_schemas=raw_schemas,
-        destinations=destinations, cancel_event=None,
-        job_context={"requested_by": args.author, "workstation_name": socket.gethostname()},
+        destinations=destinations, cancel_event=None, **extra,
         progress_callback=lambda stage, pct, msg: print(f"[{stage} {pct:>3}%] {msg}", flush=True),
         post_commit_callback=lambda *a, **k: None, timing_report=report)
     if args.skip_register:

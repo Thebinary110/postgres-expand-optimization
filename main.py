@@ -5429,12 +5429,14 @@ class App(ctk.CTk):
                 10,
                 "Preparing version metadata...",
             )
-            with self.service.expansion_timing_scope(
-                timing_report,
-                "prepare",
-                "Ensure control database metadata",
-            ):
-                self.service.ensure_admin_schema(cancel_event=cancel_event)
+            if not self.service.batched_preflight_enabled():
+                # (the batched preflight runs the same control-schema DDL as its first step)
+                with self.service.expansion_timing_scope(
+                    timing_report,
+                    "prepare",
+                    "Ensure control database metadata",
+                ):
+                    self.service.ensure_admin_schema(cancel_event=cancel_event)
             self.ui(
                 self.update_cross_table_expansion_progress,
                 "prepare",

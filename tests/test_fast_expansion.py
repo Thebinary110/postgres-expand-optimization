@@ -113,6 +113,30 @@ class RewriteAndLexerTests(unittest.TestCase):
         self.assertTrue(all(t[4] == 0 for t in tokens))  # no parenthesis leaked out of the literals
 
 
+class SubexpressionTests(unittest.TestCase):
+    def test_json_paths_become_narrow_columns(self):
+        sql = ("SELECT BTRIM(s.raw -> 'values' ->> 'a'), s.raw -> 'values' ->> 'b', s.raw_id "
+               "FROM src AS s WHERE NULLIF(s.raw -> 'values' ->> 'a', '') <> '' AND s.raw ->> 'top' = 'x'")
+        out, prefixes, leaves, gone = fx.hoist_json_paths(sql, "s", {"raw"})
+        self.assertEqual(prefixes, [("__pgdm_p1", "raw", "'values'")])
+        self.assertEqual(sorted(e for _n, e in leaves), ["__pgdm_p1 ->> 'a'", "__pgdm_p1 ->> 'b'", "raw ->> 'top'"])
+        self.assertEqual(out.count("s.__pgdm_k1"), 2)          # 'a' extracted once, used twice
+        self.assertEqual(gone, {"raw"})                         # every use hoisted: the wide column is dropped
+        self.assertIn("s.raw_id", out)
+
+    def test_unsafe_contexts_are_left_alone(self):
+        cases = [
+            "SELECT x + s.raw ->> 'k' FROM src s",                    # + binds tighter than ->>
+            "SELECT s.raw -> 'v' ->> 'k'::int FROM src s",            # :: binds tighter
+            "SELECT y ->> s.raw ->> 'k' FROM src s",                  # right operand of another ->>
+            "SELECT s.txt ->> 'k', s.raw FROM src s",                 # not a json column
+        ]
+        for sql in cases:
+            with self.subTest(sql):
+                out, prefixes, leaves, gone = fx.hoist_json_paths(sql, "s", {"raw"})
+                self.assertEqual(leaves, [], out)
+
+
 class PlanningTests(unittest.TestCase):
     def catalog(self, owned_child=True):
         parent = destination("table3", [column("id", "bigint", "public.table3_id_seq", "d"), column("a"), column("b")],

@@ -28,9 +28,12 @@ coordinator transaction, i.e. exactly as before.
 """
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 import os
+import tarfile
 import re
 import shlex
 
@@ -230,6 +233,11 @@ _NOT_ALIAS = {"where", "join", "inner", "left", "right", "full", "cross", "natur
               "order", "limit", "offset", "window", "union", "intersect", "except", "for", "fetch", "lateral"}
 
 
+def _top_level_from(query: str) -> int:
+    """Offset of the top-level FROM of a SELECT (the end of its select list)."""
+    return next(t[2] for t in lex(query) if t[0] == "word" and t[1] == "from" and t[4] == 0)
+
+
 def rewrite_relations(sql: str, managed: dict[tuple[str, str], str]) -> str:
     """Replace schema-qualified references to managed relations (schema, table) -> new schema name.
     Unqualified references are redirected through search_path by the caller."""
@@ -252,6 +260,85 @@ def rewrite_relations(sql: str, managed: dict[tuple[str, str], str]) -> str:
     for start, end, text in sorted(edits, reverse=True):
         sql = sql[:start] + text + sql[end:]
     return sql
+
+
+# --------------------------------------------------------------------------- common subexpressions
+# Lower-precedence context in which "alias.col -> 'key'" is a complete operand (PostgreSQL precedence:
+# -> / ->> are "other" operators: tighter than comparison / IS / NOT / AND / OR, looser than + - * / ^ :: [ ].)
+_CSE_BEFORE_WORDS = {"select", "where", "and", "or", "not", "on", "when", "then", "else", "case", "in",
+                     "between", "is", "distinct", "all"}
+_CSE_BEFORE_SYMBOLS = {"(", ",", "=", "<", ">", "<=", ">=", "<>", "!="}
+_CSE_AFTER_SYMBOLS = {")", ",", "->", "->>", "#>", "#>>", "=", "<", ">", "<=", ">=", "<>", "!=", "||", ";"}
+_CSE_AFTER_WORDS = {"from", "where", "and", "or", "as", "then", "else", "end", "when", "is", "group", "order",
+                    "having", "limit", "offset", "join", "on", "not", "in", "between", "like", "ilike", "similar",
+                    "union", "intersect", "except", "window", "inner", "left", "right", "full", "cross"}
+
+
+def _operator_runs(tokens):
+    """Merge adjacent symbol tokens (no whitespace) into operators: -> ->> #> <= <> ..."""
+    out = []
+    for tok in tokens:
+        if (out and tok[0] == "symbol" and out[-1][0] == "op" and out[-1][3] == tok[2]
+                and tok[1] not in "(),;" and out[-1][1][-1] not in "(),;"):
+            prev = out[-1]
+            out[-1] = ("op", prev[1] + tok[1], prev[2], tok[3], prev[4])
+        elif tok[0] == "symbol":
+            out.append(("op", tok[1], tok[2], tok[3], tok[4]))
+        else:
+            out.append(tok)
+    return out
+
+
+def hoist_json_paths(sql: str, alias: str, json_columns: set[str]):
+    """Hoist every `alias.col -> 'p' ->> 'k'` and `alias.col ->> 'k'` (col json/jsonb) that is a complete
+    operand into narrow per-row columns. -> (rewritten sql, prefixes [(name, col_sql, 'p')],
+    leaves [(name, source expression)], columns no longer referenced directly).
+    Each prefix (the big `col -> 'p'` sub-object) is computed once per source row and each key extracted
+    once, instead of once per use; json/jsonb -> / ->> with text keys cannot fail, so evaluating them for
+    every row of the range is equivalent to evaluating them where they are used."""
+    toks = _operator_runs(lex(sql))
+    alias_key = alias.strip('"') if alias.startswith('"') else alias.lower()
+    matches = []
+    i = 1
+    while i < len(toks) - 4:
+        a, dot, col = toks[i:i + 3]
+        if not (_name(a) == alias_key and dot[1] == "." and col[0] in ("word", "ident") and _name(col) in json_columns):
+            i += 1
+            continue
+        j, prefix = i + 3, None
+        if (j + 3 < len(toks) and toks[j][0] == "op" and toks[j][1] == "->" and toks[j + 1][0] == "string"
+                and toks[j + 2][0] == "op" and toks[j + 2][1] == "->>" and toks[j + 3][0] == "string"):
+            prefix, leaf, end_tok = toks[j + 1][1], toks[j + 3][1], j + 3
+        elif j + 1 < len(toks) and toks[j][0] == "op" and toks[j][1] == "->>" and toks[j + 1][0] == "string":
+            leaf, end_tok = toks[j + 1][1], j + 1
+        else:
+            i += 1
+            continue
+        before = toks[i - 1]
+        after = toks[end_tok + 1] if end_tok + 1 < len(toks) else ("op", ";", 0, 0, 0)
+        literals = [x for x in (prefix, leaf) if x is not None]
+        ok = (all(x.startswith("'") for x in literals)
+              and ((before[0] == "word" and before[1] in _CSE_BEFORE_WORDS)
+                   or (before[0] == "op" and before[1] in _CSE_BEFORE_SYMBOLS))
+              and ((after[0] == "word" and after[1] in _CSE_AFTER_WORDS)
+                   or (after[0] == "op" and after[1] in _CSE_AFTER_SYMBOLS - {"->", "->>", "#>", "#>>"})))
+        if ok:
+            matches.append((a[2], toks[end_tok][3], _name(col), sql[col[2]:col[3]], prefix, leaf))
+        i = end_tok + 1
+    prefixes, leaves, edits = {}, {}, []
+    for start, end, col, col_sql, prefix, leaf in matches:
+        source = col_sql
+        if prefix is not None:
+            pname = prefixes.setdefault((col, prefix), (f"__pgdm_p{len(prefixes) + 1}", col_sql, prefix))[0]
+            source = pname
+        lname = leaves.setdefault((source, leaf), f"__pgdm_k{len(leaves) + 1}")
+        edits.append((start, end, f"{alias}.{lname}"))
+    for start, end, text in sorted(edits, reverse=True):
+        sql = sql[:start] + text + sql[end:]
+    remaining = {_name(t) for t in lex(sql) if t[0] in ("word", "ident")}
+    gone = {col for col in json_columns if col not in remaining}
+    return (sql, list(prefixes.values()), [(name, f"{src} ->> {leaf}") for (src, leaf), name in leaves.items()],
+            gone)
 
 
 # --------------------------------------------------------------------------- job bookkeeping
@@ -304,12 +391,12 @@ def job_setup_step(job_dir: str, job_id: str, first_views: str | None) -> list[s
     """Coordinator lines (before its transaction) that register the job and, for parallel plans, create
     the checkpoint units, staging schema and first views. They commit on their own (workers must see
     them) and are timed so the setup is part of the measured total."""
-    body = [f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/setup.sql')}"]
+    scripts = ["setup.sql"] + (["stage_setup.sql", first_views] if first_views else [])
+    # one psql session runs the three committed setup scripts in order (each is its own transaction)
+    body = ["\\! psql -X -q -v ON_ERROR_STOP=1 " + " ".join(f"-f {shlex.quote(job_dir + '/' + f)}" for f in scripts)]
     if first_views:
-        body += [f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/stage_setup.sql')}",
-                 f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/' + first_views)}",
-                 f"SELECT 1 / (SELECT count(*)::int FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)}) "
-                 "AS setup_check \\g /dev/null"]
+        body.append(f"SELECT 1 / (SELECT count(*)::int FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)}) "
+                    "AS setup_check \\g /dev/null")
     body.append(f"SELECT 1 / (SELECT count(*)::int FROM {qi(JOB_SCHEMA)}.jobs WHERE job_id = {ql(job_id)} "
                 "AND state = 'running') AS job_check \\g /dev/null")
     t = _Timings()
@@ -347,11 +434,16 @@ def runner_script(job_dir: str, files: dict, env: dict) -> str:
     lines = ["set -u", f"d={shlex.quote(job_dir)}", 'mkdir -p "$d"', 'chmod 700 "$d"', 'rm -f "$d/status"']
     for k, v in env.items():
         lines.append(f"export {k}={shlex.quote(str(v))}")
-    for name, content in files.items():
-        tag = "PGDM_FAST_EOF"
-        while tag in content:
-            tag += "_X"
-        lines.append(f"cat > \"$d/{name}\" <<'{tag}'\n{content}{'' if content.endswith(chr(10)) else chr(10)}{tag}")
+    # every job file in one compressed archive: one tar process instead of one shell write per file
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w:gz", compresslevel=6) as archive:
+        for name, content in files.items():
+            data = content.encode("utf-8")
+            info = tarfile.TarInfo(name)
+            info.size, info.mode = len(data), 0o600
+            archive.addfile(info, io.BytesIO(data))
+    lines.append("base64 -d <<'PGDM_FAST_ARCHIVE' | tar -xzf - -C \"$d\"\n"
+                 + base64.b64encode(buffer.getvalue()).decode("ascii") + "\nPGDM_FAST_ARCHIVE")
     lines.append('cat > "$d/run.sh" <<\'PGDM_RUN_EOF\'\n'
                  'd="$(cd "$(dirname "$0")" && pwd)"\n'
                  'psql -X -qAt -v ON_ERROR_STOP=1 -f "$d/coordinator.sql" >"$d/coordinator.out" 2>"$d/coordinator.err"\n'
@@ -391,6 +483,14 @@ SELECT json_build_object(
                     WHERE n.nspname = {ql(source_schema)} AND c.relname = {ql(source_table)}),
   'source_rows_estimate', (SELECT c.reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                            WHERE n.nspname = {ql(source_schema)} AND c.relname = {ql(source_table)}),
+  'source_columns', (SELECT COALESCE(json_agg(a.attname ORDER BY a.attnum), '[]'::json) FROM pg_attribute a
+                     JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = {ql(source_schema)} AND c.relname = {ql(source_table)}
+                       AND a.attnum > 0 AND NOT a.attisdropped),
+  'source_json_columns', (SELECT COALESCE(json_agg(a.attname), '[]'::json) FROM pg_attribute a
+                          JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+                          WHERE n.nspname = {ql(source_schema)} AND c.relname = {ql(source_table)}
+                            AND a.attnum > 0 AND NOT a.attisdropped AND a.atttypid IN ('json'::regtype, 'jsonb'::regtype)),
   'aggregate_names', (SELECT COALESCE(json_agg(DISTINCT p.proname), '[]'::json)
                       FROM pg_proc p WHERE p.prokind IN ('a', 'w')
                         AND p.proname IN (SELECT column1 FROM (VALUES {fn_values}) v)),
@@ -677,6 +777,10 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
     if current:
         waves.append(current)
     wave_of = {seg["name"]: k for k, wave in enumerate(waves) for seg in wave}
+    json_columns = set(catalog.get("source_json_columns") or []) if os.environ.get("PDM_FAST_CSE", "1") != "0" else set()
+    source_columns = list(catalog.get("source_columns") or [])
+    if not source_columns:
+        json_columns = set()  # cannot build the narrow projection
 
     def unit_sql(seg, u, lo, hi):
         meta = dest_meta[seg["key"]]
@@ -687,12 +791,25 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
         ranged = (source_sql.rstrip()[:-1].rstrip() + f"\n      AND ctid >= '({lo},0)'::tid"
                   + (f" AND ctid < '({hi},0)'::tid" if hi is not None else "") + "\n)")
         table = f"{seg['name']}_u{u}"
+        leaves = []
+        if seg.get("source_alias") and json_columns:
+            body, prefixes, leaves, gone = hoist_json_paths(body, seg["source_alias"], json_columns)
+        if leaves:
+            # inner: each JSON sub-object once per row; middle: each key once, keeping only narrow columns
+            # (the big JSON column is dropped when every use was hoisted). OFFSET 0 fences keep the planner
+            # from inlining the expressions back into each use.
+            keep = [qi(c) for c in source_columns if c not in gone] + ["__pgdm_ctid"]
+            inner = ranged.replace("SELECT *", "SELECT *, ctid AS __pgdm_ctid"
+                                   + "".join(f", {col_sql} -> {lit} AS {name}" for name, col_sql, lit in prefixes), 1)
+            inner = inner[:-1].rstrip() + "\n    OFFSET 0\n)"
+            ranged = (f"(\n    SELECT {', '.join(keep)}, " + ", ".join(f"{expr} AS {name}" for name, expr in leaves)
+                      + f"\n    FROM {inner} AS __pgdm_q\n    OFFSET 0\n)")
         if seg["mode"] == "parallel":
             # rows are staged in the order the original plan produces them: by the source row's
             # physical position, then (several rows per source row) in emission order
-            ranged_ctid = ranged.replace("SELECT *", "SELECT *, ctid AS __pgdm_ctid", 1)
+            ranged_ctid = ranged if leaves else ranged.replace("SELECT *", "SELECT *, ctid AS __pgdm_ctid", 1)
             target = f"{qi(xs)}.{qi(table)}"
-            cut = seg["from_pos"] - seg["query_start"]
+            cut = _top_level_from(body)
             with_ctid = body[:cut].rstrip() + f",\n    {seg['source_alias']}.__pgdm_ctid\n" + body[cut:]
             sel_ctid = rewrite_relations(with_ctid.replace(source_sql, ranged_ctid), managed_rel)
             cols = [f"c{k + 1}" for k in range(len(seg["columns"]))]
@@ -768,7 +885,7 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
                                        seg["table_name"], seg["statement_index"]))
     if exported:
         # hand the rows this transaction inserted to the worker sessions (they cannot see uncommitted rows)
-        body = []
+        body, loads, checks = [], [], []
         for key in exported:
             mine = (f"SELECT * FROM {qi(key[0])}.{qi(key[1])} "
                     "WHERE xmin::text::bigint = txid_current() % 4294967296")
@@ -779,11 +896,14 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
                 f"TRUNCATE {serial_copy(key)};\n"
                 f"\\copy {serial_copy(key)} FROM {ql(path)} WITH (FORMAT binary)\n"
                 "COMMIT;\n")
-            body.append(f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/' + key[1] + '__serial_load.sql')}")
-            body.append(f"DO $pgdm_fast_copy$ BEGIN IF (SELECT count(*) FROM {serial_copy(key)}) <> ({mine.replace('SELECT *', 'SELECT count(*)', 1)}) "
+            loads.append(key[1] + "__serial_load.sql")
+            checks.append(f"DO $pgdm_fast_copy$ BEGIN IF (SELECT count(*) FROM {serial_copy(key)}) <> ({mine.replace('SELECT *', 'SELECT count(*)', 1)}) "
                         f"THEN RAISE EXCEPTION 'Could not hand the rows of {key[0]}.{key[1]} to the parallel workers.'; "
                         "END IF; END $pgdm_fast_copy$;")
-        body.append(f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/w0_views.sql')}")
+        # one psql session loads every copy (own transactions) and then refreshes the first wave's views
+        body.append("\\! psql -X -q -v ON_ERROR_STOP=1 " + " ".join(f"-f {shlex.quote(job_dir + '/' + f)}"
+                                                                    for f in loads + ["w0_views.sql"]))
+        body += checks
         t.around(9, "Hand serially inserted rows to the parallel workers", "\n".join(body))
     bulk_keys = [k for k in dest_meta if plan.bulk.get(k)]
     drops, index_restores, fk_restores = _bulk_ddl(bulk_keys, dest_meta)

@@ -13833,6 +13833,10 @@ SELECT json_build_object(
 )::text;
 """.strip()
 
+    @staticmethod
+    def batched_preflight_enabled() -> bool:
+        return os.environ.get("PDM_BATCH_PREFLIGHT", "1") != "0"
+
     # ------------------------------------------------------------------ recoverable expansion jobs
     @staticmethod
     def _expansion_token_sql(source_schema_name: str, source_table_name: str, destinations) -> str:
@@ -14160,11 +14164,16 @@ SELECT json_build_object(
             "[ -f \"$f\" ] && p=\"$(cat \"$f\")\" && j=\"$(basename \"$(dirname \"$f\")\")\" && "
             "tr '\\0' ' ' < \"/proc/$p/cmdline\" 2>/dev/null | grep -q \"expand_jobs/$j/run.sh\" && "
             "echo \"PGDM_ALIVE $j\"; done; "
-            f"PGUSER={shlex.quote(self.sql_username)} PGDATABASE={shlex.quote(CONTROL_DB)} "
-            "psql -h localhost -X -qAt -f \"$pgdm_dir/control.sql\" </dev/null && "
-            "echo PGDM_SECTION_DATA && "
+            # the two databases are independent: both sessions run concurrently
+            f"(PGUSER={shlex.quote(self.sql_username)} PGDATABASE={shlex.quote(CONTROL_DB)} "
+            "psql -h localhost -X -qAt -f \"$pgdm_dir/control.sql\" </dev/null >\"$pgdm_dir/control.out\" "
+            "2>\"$pgdm_dir/control.err\"; echo $? >\"$pgdm_dir/control.status\") & "
             f"PGUSER={shlex.quote(self.sql_username)} PGDATABASE={shlex.quote(database_name)} "
-            "psql -h localhost -X -qAt -f \"$pgdm_dir/data.sql\" </dev/null"
+            "psql -h localhost -X -qAt -f \"$pgdm_dir/data.sql\" </dev/null >\"$pgdm_dir/data.out\"; "
+            "pgdm_data_status=$?; wait; "
+            "cat \"$pgdm_dir/control.out\"; echo PGDM_SECTION_DATA; cat \"$pgdm_dir/data.out\"; "
+            "if [ \"$(cat \"$pgdm_dir/control.status\")\" != 0 ]; then cat \"$pgdm_dir/control.err\" >&2; exit 1; fi; "
+            "exit $pgdm_data_status"
         )
         payload = (
             'pgdm_dir="$(mktemp -d)"; trap \'rm -rf "$pgdm_dir"\' EXIT\n'
@@ -14880,6 +14889,8 @@ FROM pg_temp.pgdm_expansion_timings;
             "destinations": prepared["destinations"],
             "timing_report": timing_report,
             "job_id": job_id,
+            # the batched preflight ran the control-schema DDL moments ago in this same operation
+            "control_metadata_ensured": batched is not None,
         }
 
     def execute_sql_script(
@@ -15666,12 +15677,13 @@ COMMIT;
     ) -> list[dict]:
         if timing_report is None:
             timing_report = (expansion_result or {}).get("timing_report")
-        with self.expansion_timing_scope(
-            timing_report,
-            "version",
-            "Ensure control metadata for version registration",
-        ):
-            self._ensure_control_metadata(cancel_event=cancel_event)
+        if not (expansion_result or {}).get("control_metadata_ensured"):
+            with self.expansion_timing_scope(
+                timing_report,
+                "version",
+                "Ensure control metadata for version registration",
+            ):
+                self._ensure_control_metadata(cancel_event=cancel_event)
         build_cpu_started_at = time.thread_time()
         database_name = str(
             (expansion_result or {}).get("source_database_name") or ""
