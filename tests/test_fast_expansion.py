@@ -191,13 +191,21 @@ class RenderTests(unittest.TestCase):
         self.assertEqual(coordinator.count("\nCOMMIT;"), 1)                 # one atomic commit
         self.assertLess(coordinator.index("Verify parallel checkpoints"), coordinator.index("Insert into public.table1"))
         self.assertIn("LOCK TABLE \"public\".\"raw_data\" IN SHARE MODE", coordinator)
-        unit = files["s5_u0.sql"]                                           # table2, first block range
+        unit = next(text for name, text in files.items()                    # table2, first block range
+                    if name.startswith("w") and '"s5_u0"' in text)
         self.assertIn("ctid >= '(0,0)'::tid", unit)
         self.assertIn('"pgdm_xs_jobid".table1', unit)                       # reads the staged view of table1
         self.assertIn("ORDER BY __src, __e", unit)                          # original emission order
         reduce = files["s0_r0.sql"]                                         # DISTINCT reduce
         self.assertIn("SELECT DISTINCT c1, c2, c3, c4, c5", reduce)
         self.assertIn("ORDER BY 1, 2, 3, 4, 5", reduce)
+        # one pass per source range for independent statements: {table3, table4}, {table1},
+        # {table5, table6, table2}
+        waves = sorted(n for n in files if n.startswith("phase_w") and n.endswith(".list"))
+        self.assertEqual(waves, ["phase_w0.list", "phase_w1.list", "phase_w2.list"])
+        w2 = next(text for name, text in files.items() if name.startswith("w2_u0"))
+        for segment in ("s3_u0", "s4_u0", "s5_u0"):
+            self.assertIn(f'"{segment}"', w2)
 
 
 if __name__ == "__main__":

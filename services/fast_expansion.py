@@ -398,6 +398,7 @@ SELECT json_build_object(
       'schema_name', r.schema_name, 'table_name', r.table_name,
       'owned', pg_has_role(c.relowner, 'USAGE'),
       'rows_estimate', GREATEST(c.reltuples, 0)::bigint,
+      'empty', pg_relation_size(r.relid) = 0,
       'has_rules', c.relhasrules,
       'user_triggers', (SELECT count(*) FROM pg_trigger t WHERE t.tgrelid = r.relid AND NOT t.tgisinternal),
       'columns', (SELECT json_agg(json_build_object(
@@ -416,6 +417,9 @@ SELECT json_build_object(
             'name', con.conname, 'type', con.contype, 'def', pg_get_constraintdef(con.oid),
             'validated', con.convalidated,
             'can_reference', CASE WHEN con.contype = 'f' THEN has_table_privilege(con.confrelid, 'REFERENCES') END,
+            'ref_schema', (SELECT n3.nspname FROM pg_class c3 JOIN pg_namespace n3 ON n3.oid = c3.relnamespace
+                           WHERE c3.oid = con.confrelid),
+            'ref_table', (SELECT c3.relname FROM pg_class c3 WHERE c3.oid = con.confrelid),
             'comment', obj_description(con.oid, 'pg_constraint')) ORDER BY con.conname), '[]'::json)
           FROM pg_constraint con WHERE con.conrelid = r.relid AND con.contype IN ('p', 'u', 'f', 'x')),
       'incoming_fks', (SELECT COALESCE(json_agg(json_build_object(
@@ -450,6 +454,7 @@ class Plan:
         self.bulk = {}              # (schema, table) -> drop/recreate secondary structures
         self.reasons = []           # why the whole job is serial (if it is)
         self.exact_ids = True       # whether the original's identity values are reproducible at all
+        self.pipeline = False       # overlap coordinator inserts/index builds with the next parallel phase
 
     @property
     def parallel(self) -> bool:
@@ -496,7 +501,7 @@ def build_plan(prepared: dict, source_sql: str, catalog: dict, worker_slots: int
         for si, stmt in enumerate(dest["statements"], start=1):
             info = analyse_statement(stmt, source_sql, aggregates)
             seg = {"dest_index": di, "statement_index": si, "table_name": dest["table_name"], "key": key,
-                   "statement": stmt, **info}
+                   "statement": stmt, "reads": {tuple(r) for r in dest.get("read_relations") or []}, **info}
             seg["columns"] = list(info.get("insert_columns") or dest.get("destination_columns") or [])
             if plan.reasons:
                 seg.update(mode="serial", reason="; ".join(plan.reasons))
@@ -537,11 +542,16 @@ def build_plan(prepared: dict, source_sql: str, catalog: dict, worker_slots: int
     plan.workers = max(1, min(worker_slots, rows // min_rows_per_unit or 1))
     # bounded ranges: per-range sorts stay in memory, joins against staged rows stay index lookups,
     # and a checkpoint never holds more than ~max_rows_per_unit source rows of work
-    plan.units = max(plan.workers, -(-rows // max_rows_per_unit))
+    # whole rounds: the range count is a multiple of the worker count, so no round runs half-empty
+    plan.units = plan.workers * max(1, -(-rows // (plan.workers * max_rows_per_unit)))
     for key, meta in dest_meta.items():
         grows = any(s["key"] == key and s["mode"] != "serial" for s in plan.segments)
         plan.bulk[key] = (grows and bool(meta["owned"]) and _bulk_safe(meta, dest_meta)
                           and int(meta["rows_estimate"] or 0) <= 2 * max(rows, 1))
+    # Pipelined coordinator: when every destination starts empty, workers never read the destination
+    # tables themselves, so the coordinator can insert and index one segment while the next is computed.
+    plan.pipeline = (plan.parallel and all(m.get("empty") for m in dest_meta.values())
+                     and not any(s.get("serial_kind") == "tail" for s in plan.segments))
     return plan
 
 
@@ -635,73 +645,107 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
     def views_sql(upto):
         """Views named like each destination: committed rows + rows the coordinator inserted serially
         before the first parallel segment + rows staged by parallel segments < upto."""
-        out = ["SET client_min_messages = warning;", "BEGIN;"]
+        out = ["SET client_min_messages = warning;", "SET lock_timeout = '120s';", "BEGIN;"]
         for key in dest_meta:
-            parts = [f"SELECT * FROM {qi(key[0])}.{qi(key[1])}"]
+            # pipeline mode: the destination was empty when locked; its only rows are the coordinator's own,
+            # invisible to other sessions, so workers never touch (or wait for) the destination table
+            parts = [] if plan.pipeline else [f"SELECT * FROM {qi(key[0])}.{qi(key[1])}"]
             if key in exported:
                 parts.append(f"SELECT * FROM {serial_copy(key)}")
             for s in plan.segments[:upto]:
                 if s["key"] == key and s["mode"] != "serial":
                     parts.append(f"SELECT * FROM {qi(xs)}.{qi(s['name'] + '_c')}" if s["read_later"]
                                  else full_rows_sql(s))
+            if not parts:
+                # an empty relation of the destination's shape that does not touch (lock) the destination
+                parts = ["SELECT " + ", ".join(f"NULL::{c['type']} AS {qi(c['name'])}"
+                                               for c in dest_meta[key]["columns"]) + " WHERE false"]
             out.append(f"CREATE OR REPLACE VIEW {qi(xs)}.{qi(key[1])} AS\n" + "\nUNION ALL\n".join(parts) + ";")
         out.append("COMMIT;")
         return "\n".join(out) + "\n"
 
     managed_rel = {key: xs for key in dest_meta}
-    for idx, seg in enumerate(par):
-        i = plan.segments.index(seg)
+    # Waves: consecutive parallel statements that do not read (or re-write) a destination written in the
+    # same wave share one pass over each source range (the range is read once while it is hot).
+    waves, current, written = [], [], set()
+    for seg in par:
+        if current and (seg["reads"] & written or seg["key"] in written):
+            waves.append(current)
+            current, written = [], set()
+        current.append(seg)
+        written.add(seg["key"])
+    if current:
+        waves.append(current)
+    wave_of = {seg["name"]: k for k, wave in enumerate(waves) for seg in wave}
+
+    def unit_sql(seg, u, lo, hi):
         meta = dest_meta[seg["key"]]
         coltypes = {c["name"]: c["type"] for c in meta["columns"]}
         stage_cols = ", ".join(f"{qi(c)} {coltypes[c]}" for c in seg["columns"])
         q = seg["statement"]
-        body, head = q[seg["query_start"]:], q[:seg["query_start"]]
-        files[f"{seg['name']}_views.sql"] = views_sql(i)
+        body = q[seg["query_start"]:]
+        ranged = (source_sql.rstrip()[:-1].rstrip() + f"\n      AND ctid >= '({lo},0)'::tid"
+                  + (f" AND ctid < '({hi},0)'::tid" if hi is not None else "") + "\n)")
+        table = f"{seg['name']}_u{u}"
+        if seg["mode"] == "parallel":
+            # rows are staged in the order the original plan produces them: by the source row's
+            # physical position, then (several rows per source row) in emission order
+            ranged_ctid = ranged.replace("SELECT *", "SELECT *, ctid AS __pgdm_ctid", 1)
+            target = f"{qi(xs)}.{qi(table)}"
+            cut = seg["from_pos"] - seg["query_start"]
+            with_ctid = body[:cut].rstrip() + f",\n    {seg['source_alias']}.__pgdm_ctid\n" + body[cut:]
+            sel_ctid = rewrite_relations(with_ctid.replace(source_sql, ranged_ctid), managed_rel)
+            cols = [f"c{k + 1}" for k in range(len(seg["columns"]))]
+            sql = (f"CREATE UNLOGGED TABLE {target} ({stage_cols}, __rn bigint GENERATED ALWAYS AS IDENTITY);\n"
+                   f"INSERT INTO {target} ({', '.join(qi(c) for c in seg['columns'])})\n"
+                   f"SELECT {', '.join(cols)} FROM (\n"
+                   f"  SELECT x.*, row_number() OVER () AS __e FROM (\n{sel_ctid}\n  ) AS x({', '.join(cols)}, __src)\n"
+                   f") AS y ORDER BY __src, __e;\n")
+        else:  # partial DISTINCT, in the SELECT's own output types
+            sel = rewrite_relations(body.replace(source_sql, ranged), managed_rel)
+            aliases = ", ".join(f"c{k + 1}" for k in range(len(seg["columns"])))
+            sql = f"CREATE UNLOGGED TABLE {qi(xs)}.{qi(table)} AS SELECT * FROM (\n{sel}\n) AS q({aliases});\n"
+        return table, sql
+
+    for k, wave in enumerate(waves):
+        files[f"w{k}_views.sql"] = views_sql(plan.segments.index(wave[0]))
         unit_files = []
         for u, (lo, hi) in enumerate(ranges):
-            ranged = (source_sql.rstrip()[:-1].rstrip() + f"\n      AND ctid >= '({lo},0)'::tid"
-                      + (f" AND ctid < '({hi},0)'::tid" if hi is not None else "") + "\n)")
-            ranged_ctid = ranged.replace("SELECT *", "SELECT *, ctid AS __pgdm_ctid", 1)
-            sel = rewrite_relations(body.replace(source_sql, ranged), managed_rel)
-            table = f"{seg['name']}_u{u}"
-            if seg["mode"] == "parallel":
-                # rows are staged in the order the original plan produces them: by the source row's
-                # physical position, then (several rows per source row) in emission order
-                target = f"{qi(xs)}.{qi(table)}"
-                cut = seg["from_pos"] - seg["query_start"]
-                with_ctid = body[:cut].rstrip() + f",\n    {seg['source_alias']}.__pgdm_ctid\n" + body[cut:]
-                sel_ctid = rewrite_relations(with_ctid.replace(source_sql, ranged_ctid), managed_rel)
-                cols = [f"c{k + 1}" for k in range(len(seg["columns"]))]
+            blocks = [_unit_block(xs, job_id, *unit_sql(seg, u, lo, hi)) for seg in wave]
+            name = f"w{k}_u{u}.sql"
+            files[name] = _unit_header(xs, catalog["search_path"]) + "".join(blocks)
+            unit_files.append(name)
+        files[f"phase_w{k}.list"] = "\n".join(unit_files) + "\n"
+        reduce_files, post_files = [], []
+        for seg in wave:
+            meta = dest_meta[seg["key"]]
+            if seg["mode"] == "distinct":
+                coltypes = {c["name"]: c["type"] for c in meta["columns"]}
+                stage_cols = ", ".join(f"{qi(c)} {coltypes[c]}" for c in seg["columns"])
+                head = seg["statement"][:seg["query_start"]]
+                aliases = ", ".join(f"c{j + 1}" for j in range(len(seg["columns"])))
+                union = "\nUNION ALL\n".join(f"SELECT {aliases} FROM {qi(xs)}.{qi(seg['name'] + '_u' + str(u))}"
+                                             for u in range(len(ranges)))
+                target = f"{qi(xs)}.{qi(seg['name'] + '_r0')}"
                 sql = (f"CREATE UNLOGGED TABLE {target} ({stage_cols}, __rn bigint GENERATED ALWAYS AS IDENTITY);\n"
-                       f"INSERT INTO {target} ({', '.join(qi(c) for c in seg['columns'])})\n"
-                       f"SELECT {', '.join(cols)} FROM (\n"
-                       f"  SELECT x.*, row_number() OVER () AS __e FROM (\n{sel_ctid}\n  ) AS x({', '.join(cols)}, __src)\n"
-                       f") AS y ORDER BY __src, __e;\n")
-            else:
-                aliases = ", ".join(f"c{k + 1}" for k in range(len(seg["columns"])))
-                sql = f"CREATE UNLOGGED TABLE {qi(xs)}.{qi(table)} AS SELECT * FROM (\n{sel}\n) AS q({aliases});\n"
-            unit_files.append(_unit_file(files, xs, job_id, table, sql, catalog["search_path"]))
-        files[f"phase_{seg['name']}.list"] = "\n".join(unit_files) + "\n"
-        if seg["mode"] == "distinct":
-            aliases = ", ".join(f"c{k + 1}" for k in range(len(seg["columns"])))
-            union = "\nUNION ALL\n".join(f"SELECT {aliases} FROM {qi(xs)}.{qi(seg['name'] + '_u' + str(u))}"
-                                         for u in range(len(ranges)))
-            target = f"{qi(xs)}.{qi(seg['name'] + '_r0')}"
-            sql = (f"CREATE UNLOGGED TABLE {target} ({stage_cols}, __rn bigint GENERATED ALWAYS AS IDENTITY);\n"
-                   f"{head[:seg['target_span'][0]]}{target}{head[seg['target_span'][1]:]}"
-                   f"SELECT {aliases} FROM (SELECT DISTINCT {aliases} FROM (\n{union}\n) AS p) AS d "
-                   f"ORDER BY {', '.join(str(k + 1) for k in range(len(seg['columns'])))};\n")
-            files[f"phase_{seg['name']}.reduce"] = _unit_file(files, xs, job_id, f"{seg['name']}_r0", sql,
-                                                               catalog["search_path"]) + "\n"
-        files[f"phase_{seg['name']}.post"] = _post_phase_sql(xs, seg, unit_tables(seg), seq_col(seg), meta,
-                                                              full_rows_sql(seg))
-        files[f"phase_{seg['name']}.next"] = (f"{par[idx + 1]['name']}_views.sql\n" if idx + 1 < len(par) else "\n")
+                       f"{head[:seg['target_span'][0]]}{target}{head[seg['target_span'][1]:]}"
+                       f"SELECT {aliases} FROM (SELECT DISTINCT {aliases} FROM (\n{union}\n) AS p) AS d "
+                       f"ORDER BY {', '.join(str(j + 1) for j in range(len(seg['columns'])))};\n")
+                name = f"{seg['name']}_r0.sql"
+                files[name] = _unit_header(xs, catalog["search_path"]) + _unit_block(xs, job_id, f"{seg['name']}_r0", sql)
+                reduce_files.append(name)
+            name = f"post_{seg['name']}.sql"
+            files[name] = _post_phase_sql(xs, seg, unit_tables(seg), seq_col(seg), meta, full_rows_sql(seg))
+            post_files.append(name)
+        files[f"phase_w{k}.reduce"] = "".join(f + "\n" for f in reduce_files)
+        files[f"phase_w{k}.post"] = "".join(f + "\n" for f in post_files)
+        files[f"phase_w{k}.next"] = (f"w{k + 1}_views.sql\n" if k + 1 < len(waves) else "\n")
 
     # ---- coordinator ------------------------------------------------------------------------------
     t = _Timings()
     co = [timing_table_sql,
           "SET idle_in_transaction_session_timeout = 0;", "SET statement_timeout = 0;", "SET lock_timeout = 0;"]
-    co += job_setup_step(job_dir, job_id, par[0]["name"] + "_views.sql" if par else None)
+    co += job_setup_step(job_dir, job_id, "w0_views.sql" if par else None)
     co.append("BEGIN;")
     t.around(1, "Initialize database transaction",
              "SET LOCAL client_min_messages = warning;\nSET LOCAL synchronize_seqscans = off;")
@@ -710,6 +754,12 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
     t.around(3, "Scan source and build dependency manifest", manifest_sql)
     if prefix_sequences:
         t.lines.append(restore_sequences_sql(job_id, prefix_sequences))
+    if plan.pipeline:
+        # Every destination was empty when planned; re-checked under the lock (workers' views rely on it).
+        t.lines.append("DO $pgdm_fast_empty$ BEGIN IF " + " OR ".join(
+            f"EXISTS (SELECT 1 FROM {qi(k[0])}.{qi(k[1])})" for k in dest_meta) +
+            " THEN RAISE EXCEPTION 'A destination received rows after the expansion was planned; run it again.'; "
+            "END IF; END $pgdm_fast_empty$;")
     # statements that must run exactly as in the original (before the first parallel one)
     for i, seg in enumerate(plan.segments):
         if seg.get("serial_kind") == "prefix":
@@ -733,32 +783,131 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
             body.append(f"DO $pgdm_fast_copy$ BEGIN IF (SELECT count(*) FROM {serial_copy(key)}) <> ({mine.replace('SELECT *', 'SELECT count(*)', 1)}) "
                         f"THEN RAISE EXCEPTION 'Could not hand the rows of {key[0]}.{key[1]} to the parallel workers.'; "
                         "END IF; END $pgdm_fast_copy$;")
-        body.append(f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/' + par[0]['name'] + '_views.sql')}")
+        body.append(f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/w0_views.sql')}")
         t.around(9, "Hand serially inserted rows to the parallel workers", "\n".join(body))
-    for idx, seg in enumerate(par):
-        t.around(20 + idx, f"Parallel compute {seg['table_name']} (statement {seg['statement_index']}): "
-                           f"{len(unit_tables(seg)) if seg['mode'] == 'parallel' else len(ranges)} ranges on {plan.workers} sessions",
-                 f"\\! bash {shlex.quote(job_dir)}/phase.sh {seg['name']}", dest=seg["table_name"], stmt=seg["statement_index"])
-    if par:
-        t.around(59, "Verify parallel checkpoints", _verify_sql(xs, job_id, par, unit_tables))
     bulk_keys = [k for k in dest_meta if plan.bulk.get(k)]
-    drop_sql, restore_sql = _bulk_ddl(bulk_keys, dest_meta)
-    if drop_sql:
-        t.around(60, "Defer secondary indexes and foreign keys (bulk load)", drop_sql)
+    drops, index_restores, fk_restores = _bulk_ddl(bulk_keys, dest_meta)
+    restore_settings = ("SET LOCAL work_mem = '256MB';\nSET LOCAL maintenance_work_mem = '1GB';\n"
+                        "SET LOCAL random_page_cost = 1.1;\n"
+                        f"SET LOCAL max_parallel_maintenance_workers = {max(0, min(8, plan.workers - 1))};")
+    wave_name = [("Parallel compute " + ", ".join(f"{seg['table_name']} (statement {seg['statement_index']})"
+                                              for seg in wave)
+                  + f": {len(ranges)} ranges on {plan.workers} sessions") for wave in waves]
+    last_segment = {}
     for i, seg in enumerate(plan.segments):
-        if seg.get("serial_kind") == "tail":
-            t.lines.append(managed_dml(seg["statement"], seg["key"][0], seg["key"][1], 100 + i,
-                                       f"Insert into {seg['table_name']} (statement {seg['statement_index']})",
-                                       seg["table_name"], seg["statement_index"]))
-        elif seg["mode"] != "serial":
-            t.lines.append(_final_insert_sql(xs, seg, dest_meta[seg["key"]], unit_tables(seg), row_counts_table, 100 + i))
-    if restore_sql:
-        t.around(200, "Rebuild indexes and validate foreign keys",
-                 "SET LOCAL work_mem = '256MB';\nSET LOCAL maintenance_work_mem = '1GB';\n"
-                 "SET LOCAL random_page_cost = 1.1;\n"
-                 f"SET LOCAL max_parallel_maintenance_workers = {max(0, min(8, plan.workers - 1))};\n" + restore_sql)
+        last_segment[seg["key"]] = i
+    seq_no = [100]
+
+    def nxt():
+        seq_no[0] += 1
+        return seq_no[0]
+
+    restored, validated = set(), set()
+    # segments already in the destinations (statements run as in the original happen first)
+    inserted = {i for i, seg in enumerate(plan.segments) if seg.get("serial_kind") == "prefix"}
+
+    def table_complete(key, upto=None):
+        return all(i in inserted for i, seg in enumerate(plan.segments) if seg["key"] == key)
+
+    def restore_ready(upto):
+        """Index rebuilds for tables all of whose statements are inserted, then every FK whose two ends are
+        complete and indexed (FK validation needs the referenced unique index)."""
+        lines = []
+        for key in bulk_keys:
+            if key not in restored and table_complete(key, upto) and index_restores.get(key):
+                restored.add(key)
+                lines.append((f"Rebuild indexes of {key[0]}.{key[1]}", "\n".join(index_restores[key])))
+        for n, (child, parent, sql) in enumerate(fk_restores):
+            parent_ready = parent not in index_restores or parent in restored
+            if n not in validated and table_complete(child, upto) and table_complete(parent, upto) and parent_ready:
+                validated.add(n)
+                lines.append((f"Validate foreign key {sql.split('ADD CONSTRAINT ', 1)[1].split(' ', 1)[0]}", sql))
+        for name, sql in lines:
+            t.around(nxt(), name, restore_settings + "\n" + sql)
+
+    def insert_segment(i, seg):
+        inserted.add(i)
+        t.around(nxt(), f"Verify checkpoints of {seg['table_name']} (statement {seg['statement_index']})",
+                 _verify_sql(xs, job_id, [seg], unit_tables))
+        t.lines.append(_final_insert_sql(xs, seg, dest_meta[seg["key"]], unit_tables(seg), row_counts_table, nxt()))
+
+    if plan.pipeline:
+        # Dropping an FK locks its referenced table ACCESS EXCLUSIVE. Workers read the source, so FKs that
+        # reference the source are dropped only after the last phase, and their tables are filled then;
+        # every other destination is filled (and indexed, and its FKs validated) while later phases run.
+        source_key = (source_schema, source_table)
+        late_fk = [sql for parent, sql in drops if parent == source_key]
+        late_tables = {child for child, parent, _sql in fk_restores if parent == source_key}
+        early = [sql for parent, sql in drops if parent != source_key]
+        if early:
+            t.around(nxt(), "Defer secondary indexes and foreign keys (bulk load)", "\n".join(early))
+        pending = []
+
+        def flush(include_late):
+            for seg in [x for x in pending if include_late or x["key"] not in late_tables]:
+                pending.remove(seg)
+                i = plan.segments.index(seg)
+                insert_segment(i, seg)
+                restore_ready(i)
+
+        t.lines.append("CREATE TEMP TABLE pgdm_stream_first (segment text PRIMARY KEY, first_value bigint NOT NULL, "
+                       "increment_by bigint NOT NULL) ON COMMIT DROP;")
+        t.lines.append("CREATE TEMP TABLE pgdm_stream_acc (sequence_number integer PRIMARY KEY, item_name text, "
+                       "destination_name text, statement_index integer, seconds double precision, "
+                       "rows_affected bigint) ON COMMIT PRESERVE ROWS;")
+        wait_acc = {}
+        for k, wave in enumerate(waves):
+            streamed = [seg for seg in wave if seg["mode"] == "parallel" and seg["key"] not in late_tables]
+            for seg in streamed:
+                t.lines.append(_stream_first_sql(xs, seg, seq_col(seg)))
+            t.around(nxt(), wave_name[k] + ": start in background",
+                     f"\\! bash {shlex.quote(job_dir)}/phase.sh w{k} bg")
+            flush(include_late=False)                # overlaps with the wave just started
+            acc = {seg["name"]: nxt() for seg in streamed}
+            wait_acc[k] = nxt()
+            for u in range(len(ranges)) if streamed else []:
+                # wait for range u (ranges finish roughly in order), then insert it while the rest computes
+                t.lines.append("SELECT clock_timestamp() AS pgdm_t0 \\gset")
+                t.lines.append(f"\\! bash {shlex.quote(job_dir)}/phase.sh w{k} waitunit w{k}_u{u}.sql")
+                t.lines.append(f"INSERT INTO pg_temp.pgdm_stream_acc VALUES ({wait_acc[k]}, "
+                               f"{ql(wave_name[k] + ': waits for ranges between streamed inserts')}, NULL, NULL, "
+                               "extract(epoch FROM clock_timestamp() - :'pgdm_t0'::timestamptz), NULL) "
+                               "ON CONFLICT (sequence_number) DO UPDATE SET seconds = pgdm_stream_acc.seconds + EXCLUDED.seconds;")
+                for seg in streamed:
+                    t.lines.append(_stream_unit_sql(xs, job_id, seg, dest_meta[seg["key"]], u, acc[seg["name"]]))
+            t.around(nxt(), wave_name[k] + ": wait (after the overlapped coordinator work above)",
+                     f"\\! bash {shlex.quote(job_dir)}/phase.sh w{k} wait")
+            for seg in streamed:
+                inserted.add(plan.segments.index(seg))
+                t.around(nxt(), f"Verify streamed rows of {seg['table_name']} (statement {seg['statement_index']})",
+                         _verify_sql(xs, job_id, [seg], unit_tables) + "\n" + _stream_finish_sql(xs, job_id, seg, row_counts_table))
+            if streamed:
+                restore_ready(len(plan.segments))
+            pending.extend(seg for seg in wave if seg not in streamed)
+        if late_fk:
+            t.around(nxt(), "Defer foreign keys that reference the source (after the last phase)", "\n".join(late_fk))
+        flush(include_late=True)
+        restore_ready(len(plan.segments))
+    else:
+        for k, wave in enumerate(waves):
+            t.around(20 + k, wave_name[k], f"\\! bash {shlex.quote(job_dir)}/phase.sh w{k}")
+        if par:
+            t.around(59, "Verify parallel checkpoints", _verify_sql(xs, job_id, par, unit_tables))
+        if drops:
+            t.around(60, "Defer secondary indexes and foreign keys (bulk load)", "\n".join(sql for _p, sql in drops))
+        for i, seg in enumerate(plan.segments):
+            if seg.get("serial_kind") == "tail":
+                t.lines.append(managed_dml(seg["statement"], seg["key"][0], seg["key"][1], 100 + i,
+                                           f"Insert into {seg['table_name']} (statement {seg['statement_index']})",
+                                           seg["table_name"], seg["statement_index"]))
+            elif seg["mode"] != "serial":
+                t.lines.append(_final_insert_sql(xs, seg, dest_meta[seg["key"]], unit_tables(seg),
+                                                 row_counts_table, 100 + i))
+        restore_all = [sql for key in bulk_keys for sql in index_restores.get(key, [])] + [sql for _c, _p, sql in fk_restores]
+        if restore_all:
+            t.around(200, "Rebuild indexes and validate foreign keys", restore_settings + "\n" + "\n".join(restore_all))
     if par:
-        t.around(201, "Advance identity sequences", _sequence_sql(xs, par, dest_meta, seq_col))
+        t.around(8000, "Advance identity sequences", _sequence_sql(xs, par, dest_meta, seq_col))
     t.lines.append(commit_marker_sql(job_id, manifest_sql))
     t.lines.append(f"UPDATE {qi(JOB_SCHEMA)}.jobs SET state = 'committed', updated_at = clock_timestamp() "
                    f"WHERE job_id = {ql(job_id)};")
@@ -772,6 +921,10 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
                f"DROP SCHEMA IF EXISTS {qi(xs)} CASCADE;",
                f"DELETE FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)};",
                "UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = 9001;"]
+    if plan.pipeline:
+        co.append("INSERT INTO pg_temp.pgdm_expansion_timings SELECT sequence_number, 'execute', item_name, "
+                  "clock_timestamp(), clock_timestamp() + seconds * interval '1 second', rows_affected, destination_name, "
+                  "statement_index FROM pg_temp.pgdm_stream_acc;")
     co += [timing_result_sql, "DROP TABLE pg_temp.pgdm_expansion_timings;"]
     files["coordinator.sql"] = "\n".join(co) + "\n"
     all_sequences = sorted({c["sequence"] for m in dest_meta.values() for c in m["columns"] if c["sequence"]})
@@ -782,11 +935,8 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
     return files
 
 
-def _unit_file(files, xs, job_id, table, sql, search_path) -> str:
-    """One checkpointed unit: skipped if already done, otherwise rebuilt from scratch and marked done in
-    the same transaction that creates its staging table."""
-    name = f"{table}.sql"
-    files[name] = (
+def _unit_header(xs, search_path) -> str:
+    return (
         "\\set ON_ERROR_STOP 1\n"
         "SET client_min_messages = warning;\n"
         "SET max_parallel_workers_per_gather = 0;\n"
@@ -795,17 +945,25 @@ def _unit_file(files, xs, job_id, table, sql, search_path) -> str:
         # cost hint only (results unchanged): staged and destination rows are cached / on SSD, so joins of a
         # block range against an indexed staged relation are index lookups, not a full re-hash per range
         "SET random_page_cost = 1.1;\n"
-        f"SELECT set_config('search_path', {ql(qi(xs) + ', ' + search_path)}, false) AS search_path \\gset\n"
+        "SET lock_timeout = '120s';\n"  # a lock-order bug fails the unit (checkpoints kept) instead of hanging
+        f"SELECT set_config('search_path', {ql(qi(xs) + ', ' + search_path)}, false) AS search_path \\gset\n")
+
+
+def _unit_block(xs, job_id, table, sql) -> str:
+    """One checkpointed unit: skipped if already done, otherwise rebuilt from scratch and marked done in
+    the same transaction that creates its staging table."""
+    flag = "unit_done_" + re.sub(r"[^A-Za-z0-9_]", "_", table)
+    return (
         f"SELECT EXISTS (SELECT 1 FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND unit_id = {ql(table)} "
-        "AND state = 'done') AS unit_done \\gset\n"
-        "\\if :unit_done\n\\q\n\\endif\n"
+        f"AND state = 'done') AS {flag} \\gset\n"
+        f"\\if :{flag}\n\\else\n"
         "BEGIN;\n"
         f"DROP TABLE IF EXISTS {qi(xs)}.{qi(table)};\n"
         f"{sql}"
         f"UPDATE {qi(JOB_SCHEMA)}.units SET state = 'done', rows = (SELECT count(*) FROM {qi(xs)}.{qi(table)}), "
         f"finished_at = clock_timestamp() WHERE job_id = {ql(job_id)} AND unit_id = {ql(table)};\n"
-        "COMMIT;\n")
-    return name
+        "COMMIT;\n"
+        "\\endif\n")
 
 
 def _post_phase_sql(xs, seg, tables, seq_column, meta, full_rows) -> str:
@@ -821,7 +979,7 @@ def _post_phase_sql(xs, seg, tables, seq_column, meta, full_rows) -> str:
     else:
         first, inc = "0", "1"
     counts = ", ".join(f"({k}, (SELECT count(*) FROM {qi(xs)}.{qi(t)}))" for k, t in enumerate(tables))
-    out = ["\\set ON_ERROR_STOP 1", "SET client_min_messages = warning;", "BEGIN;",
+    out = ["\\set ON_ERROR_STOP 1", "SET client_min_messages = warning;", "SET lock_timeout = '120s';", "BEGIN;",
            f"LOCK TABLE {qi(xs)}.unit_offsets IN EXCLUSIVE MODE;",
            f"INSERT INTO {qi(xs)}.unit_offsets (segment, unit, unit_rows, unit_offset, first_value, increment_by)",
            f"SELECT {ql(seg['name'])}, k, n, COALESCE(sum(n) OVER (ORDER BY k ROWS BETWEEN UNBOUNDED PRECEDING "
@@ -859,10 +1017,13 @@ def _verify_sql(xs, job_id, par, unit_tables) -> str:
     checks.append(f"NOT EXISTS (SELECT 1 FROM {qi(JOB_SCHEMA)}.units u WHERE u.job_id = {ql(job_id)} AND u.rows > 0 "
                   f"AND u.unit_id IN ({', '.join(ql(t) for t in tables)}) AND COALESCE(pg_relation_size("
                   f"to_regclass(format('%I.%I', {ql(xs)}, u.unit_id))), 0) = 0)")
+    segs = ", ".join(ql(seg["name"]) for seg in par)
     return (f"DO $pgdm_fast_verify$ BEGIN\n"
-            f"  IF EXISTS (SELECT 1 FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND state <> 'done') THEN\n"
+            f"  IF EXISTS (SELECT 1 FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND segment IN ({segs}) "
+            f"AND state <> 'done') THEN\n"
             f"    RAISE EXCEPTION 'Parallel expansion units did not complete: %', (SELECT string_agg(unit_id, ', ') "
-            f"FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND state <> 'done');\n  END IF;\n"
+            f"FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND segment IN ({segs}) AND state <> 'done');\n"
+            f"  END IF;\n"
             f"  IF NOT ({' AND '.join(checks)}) THEN\n"
             f"    RAISE EXCEPTION 'Parallel expansion offsets are incomplete or inconsistent.';\n  END IF;\n"
             f"END $pgdm_fast_verify$;")
@@ -905,46 +1066,128 @@ END
 $pgdm_fast_insert$;"""
 
 
-def _bulk_ddl(keys, dest_meta) -> tuple[str, str]:
-    """Drop the FKs of / into the bulk destinations and their non-primary-key indexes and unique
-    constraints; recreate them afterwards with identical names and definitions (indexes, then FKs)."""
+def _stream_first_sql(xs, seg, seq_column) -> str:
+    """Capture (in the coordinator's transaction) the identity start of a segment about to be computed:
+    the recorded offsets if a previous attempt already fixed them, else the sequence's next value (which
+    the segment's post-phase will read too: nothing consumes the sequence while the wave runs)."""
+    if seq_column:
+        nxt = (f"(SELECT CASE WHEN is_called THEN last_value + {seq_column['seq_increment']} ELSE last_value END "
+               f"FROM {seq_column['sequence']})")
+        inc = str(seq_column["seq_increment"])
+    else:
+        nxt, inc = "0", "1"
+    return (f"INSERT INTO pg_temp.pgdm_stream_first VALUES ({ql(seg['name'])}, COALESCE((SELECT first_value FROM "
+            f"{qi(xs)}.unit_offsets WHERE segment = {ql(seg['name'])} LIMIT 1), {nxt}), {inc});")
+
+
+def _stream_unit_sql(xs, job_id, seg, meta, u, acc_seq) -> str:
+    """Insert one finished range of a segment while later ranges are still being computed. Its identity
+    offset is the row count of the segment's earlier ranges (committed checkpoints)."""
+    table = f"{seg['name']}_u{u}"
+    cols = [c for c in meta["columns"] if c["name"] in seg["columns"] or c["sequence"]]
+    target_cols = ", ".join(qi(c["name"]) for c in cols)
+    overriding = " OVERRIDING SYSTEM VALUE" if any(c["identity"] in ("a", "d") and c["name"] not in seg["columns"]
+                                                    for c in cols) else ""
+    exprs = [f"u.{qi(c['name'])}" if c["name"] in seg["columns"]
+             else f"(f.first_value + (pgdm_offset + u.__rn - 1) * f.increment_by)::{c['type']}" for c in cols]
+    earlier = ", ".join(ql(f"{seg['name']}_u{k}") for k in range(u)) or "NULL"
+    return f"""DO $pgdm_stream$
+DECLARE
+    pgdm_offset bigint;
+    pgdm_rows bigint;
+    pgdm_started timestamptz := clock_timestamp();
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND unit_id = {ql(table)}
+                   AND state = 'done' AND (rows = 0 OR pg_relation_size(to_regclass({ql(qi(xs) + '.' + qi(table))})) > 0)) THEN
+        RAISE EXCEPTION 'Checkpoint % is not complete.', {ql(table)};
+    END IF;
+    SELECT COALESCE(sum(rows), 0) INTO pgdm_offset FROM {qi(JOB_SCHEMA)}.units
+    WHERE job_id = {ql(job_id)} AND unit_id IN ({earlier});
+    INSERT INTO {qi(seg['key'][0])}.{qi(seg['key'][1])} ({target_cols}){overriding}
+    SELECT {', '.join(exprs)} FROM {qi(xs)}.{qi(table)} u
+    CROSS JOIN (SELECT first_value, increment_by FROM pg_temp.pgdm_stream_first
+                WHERE segment = {ql(seg['name'])}) f;
+    GET DIAGNOSTICS pgdm_rows = ROW_COUNT;
+    INSERT INTO pg_temp.pgdm_stream_acc VALUES ({acc_seq}, {ql(f"Insert into {seg['table_name']} (statement {seg['statement_index']}): ranges streamed while the wave runs")},
+        {ql(seg['table_name'])}, {int(seg['statement_index'])}, extract(epoch FROM clock_timestamp() - pgdm_started), pgdm_rows)
+    ON CONFLICT (sequence_number) DO UPDATE SET seconds = pgdm_stream_acc.seconds + EXCLUDED.seconds,
+        rows_affected = pgdm_stream_acc.rows_affected + EXCLUDED.rows_affected;
+END
+$pgdm_stream$;"""
+
+
+def _stream_finish_sql(xs, job_id, seg, row_counts_table) -> str:
+    """After the wave: the streamed rows must equal the segment's checkpointed rows, and the identity start
+    used must equal the offsets recorded by the post-phase; then the managed row counter is updated."""
+    return f"""DO $pgdm_stream_done$
+DECLARE
+    pgdm_expected bigint;
+    pgdm_streamed bigint;
+BEGIN
+    SELECT COALESCE(sum(unit_rows), 0) INTO pgdm_expected FROM {qi(xs)}.unit_offsets WHERE segment = {ql(seg['name'])};
+    SELECT COALESCE(sum(rows_affected), 0) INTO pgdm_streamed FROM pg_temp.pgdm_stream_acc
+    WHERE destination_name = {ql(seg['table_name'])} AND statement_index = {int(seg['statement_index'])};
+    IF pgdm_expected <> pgdm_streamed OR EXISTS (
+        SELECT 1 FROM {qi(xs)}.unit_offsets o JOIN pg_temp.pgdm_stream_first f ON f.segment = o.segment
+        WHERE o.segment = {ql(seg['name'])} AND o.first_value <> f.first_value) THEN
+        RAISE EXCEPTION 'Streamed rows of % do not match its checkpoints.', {ql(seg['table_name'])};
+    END IF;
+    UPDATE {row_counts_table}
+    SET row_count = row_count + pgdm_streamed, updated_at = clock_timestamp()
+    WHERE schema_name = {ql(seg['key'][0])} AND table_name = {ql(seg['key'][1])};
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Contador ausente para %.% durante insercao.', {ql(seg['key'][0])}, {ql(seg['key'][1])};
+    END IF;
+END
+$pgdm_stream_done$;"""
+
+
+def _bulk_ddl(keys, dest_meta):
+    """Drop the FKs of / into the bulk destinations and their indexes and unique / primary key constraints;
+    recreate them afterwards with identical names and definitions.
+    -> ([(referenced table or None, drop statement)] - FKs first, {table: [index / key restores, primary
+    key first]}, [(child, parent, FK restore)])"""
     if not keys:
-        return "", ""
+        return [], {}, []
     fks = {}
     for key in keys:
         meta = dest_meta[key]
         for con in meta["constraints"]:
             if con["type"] == "f":
-                fks[(key, con["name"])] = con
+                fks[(key, con["name"])] = (con, (con.get("ref_schema"), con.get("ref_table")))
         for fk in meta["incoming_fks"]:
-            fks[((fk["schema_name"], fk["table_name"]), fk["name"])] = fk
-    drop, restore_idx, restore_fk = [], [], []
-    for (tbl, name), con in sorted(fks.items()):
+            fks[((fk["schema_name"], fk["table_name"]), fk["name"])] = (fk, key)
+    drops, index_restores, fk_restores = [], {}, []
+    for (tbl, name), (con, parent) in sorted(fks.items()):
         table = f"{qi(tbl[0])}.{qi(tbl[1])}"
-        drop.append(f"ALTER TABLE {table} DROP CONSTRAINT {qi(name)};")
-        restore_fk.append(f"ALTER TABLE {table} ADD CONSTRAINT {qi(name)} {con['def']}"
-                          + ("" if con["validated"] else " NOT VALID") + ";")
+        drops.append((tuple(parent), f"ALTER TABLE {table} DROP CONSTRAINT {qi(name)};"))
+        sql = (f"ALTER TABLE {table} ADD CONSTRAINT {qi(name)} {con['def']}"
+               + ("" if con["validated"] else " NOT VALID") + ";")
         if con.get("comment"):
-            restore_fk.append(f"COMMENT ON CONSTRAINT {qi(name)} ON {table} IS {ql(con['comment'])};")
+            sql += f"\nCOMMENT ON CONSTRAINT {qi(name)} ON {table} IS {ql(con['comment'])};"
+        fk_restores.append((tbl, tuple(parent), sql))
     for key in keys:
         meta = dest_meta[key]
         table = f"{qi(key[0])}.{qi(key[1])}"
         cons = {c["name"]: c for c in meta["constraints"]}
+        restores = []
         for idx in meta["indexes"]:
             con = cons.get(idx["constraint"]) if idx["constraint"] else None
             if con:
-                drop.append(f"ALTER TABLE {table} DROP CONSTRAINT {qi(con['name'])};")
-                restore_idx.append(f"ALTER TABLE {table} ADD CONSTRAINT {qi(con['name'])} {con['def']};")
+                drops.append((None, f"ALTER TABLE {table} DROP CONSTRAINT {qi(con['name'])};"))
+                sql = f"ALTER TABLE {table} ADD CONSTRAINT {qi(con['name'])} {con['def']};"
                 if con.get("comment"):
-                    restore_idx.append(f"COMMENT ON CONSTRAINT {qi(con['name'])} ON {table} IS {ql(con['comment'])};")
+                    sql += f"\nCOMMENT ON CONSTRAINT {qi(con['name'])} ON {table} IS {ql(con['comment'])};"
             else:
-                drop.append(f"DROP INDEX {qi(key[0])}.{qi(idx['name'])};")
-                restore_idx.append(idx["def"] + ";")
+                drops.append((None, f"DROP INDEX {qi(key[0])}.{qi(idx['name'])};"))
+                sql = idx["def"] + ";"
                 if idx.get("comment"):
-                    restore_idx.append(f"COMMENT ON INDEX {qi(key[0])}.{qi(idx['name'])} IS {ql(idx['comment'])};")
-    # primary keys first: FK validation needs the referenced unique indexes
-    restore_idx.sort(key=lambda sql: 0 if " PRIMARY KEY " in sql else 1)
-    return "\n".join(drop), "\n".join(restore_idx + restore_fk)
+                    sql += f"\nCOMMENT ON INDEX {qi(key[0])}.{qi(idx['name'])} IS {ql(idx['comment'])};"
+            restores.append(sql)
+        # primary key first: FK validation needs the referenced unique index
+        restores.sort(key=lambda sql: 0 if " PRIMARY KEY " in sql else 1)
+        index_restores[key] = restores
+    return drops, index_restores, fk_restores
 
 
 def _sequence_sql(xs, par, dest_meta, seq_col) -> str:
@@ -986,13 +1229,19 @@ def _phase_script(workers) -> str:
 # reduce, identity offsets (+ materialised copy when read later), then the views for the next segment.
 # Failures are logged; the coordinator verifies every checkpoint before using any staged row.
 set -u
-d="$(cd "$(dirname "$0")" && pwd)"; seg="$1"
-run() {{ psql -X -q -v ON_ERROR_STOP=1 -f "$d/$1" >>"$d/workers.log" 2>&1 || echo "FAILED $1" >>"$d/workers.log"; }}
+d="$(cd "$(dirname "$0")" && pwd)"; seg="$1"; mode="${{2:-}}"
+# bg: run this phase detached and mark it done at the end; wait: block until the phase is marked done
+if [ "$mode" = bg ]; then rm -f "$d/phase_$seg.done" "$d/${{seg}}_u"*.sql.done; nohup bash "$0" "$seg" mark >/dev/null 2>&1 & exit 0; fi
+if [ "$mode" = wait ]; then while [ ! -f "$d/phase_$seg.done" ]; do sleep 0.02; done; exit 0; fi
+# waitunit <unit file>: until that range is finished (or the whole phase is, e.g. after a failure)
+if [ "$mode" = waitunit ]; then while [ ! -f "$d/$3.done" ] && [ ! -f "$d/phase_$seg.done" ]; do sleep 0.01; done; exit 0; fi
+run() {{ psql -X -q -v ON_ERROR_STOP=1 -f "$d/$1" >>"$d/workers.log" 2>&1 || echo "FAILED $1" >>"$d/workers.log"; touch "$d/$1.done"; }}
 export -f run; export d
 xargs -a "$d/phase_$seg.list" -P {workers} -I{{}} bash -c 'run "$1"' _ {{}}
-if [ -s "$d/phase_$seg.reduce" ]; then run "$(tr -d '\\n' < "$d/phase_$seg.reduce")"; fi
-run "phase_$seg.post"
+while read -r f; do [ -n "$f" ] && run "$f"; done < "$d/phase_$seg.reduce"
+while read -r f; do [ -n "$f" ] && run "$f"; done < "$d/phase_$seg.post"
 nv="$(tr -d '\\n' < "$d/phase_$seg.next")"
 if [ -n "$nv" ]; then run "$nv"; fi
+if [ "$mode" = mark ]; then touch "$d/phase_$seg.done"; fi
 exit 0
 """
