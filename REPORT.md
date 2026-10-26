@@ -182,6 +182,9 @@ from the catalog and, below it, reproduces the original exactly (including hash-
 * Validating a foreign key that references the source reads the source heap unless its visibility map is set
   (autovacuum); about 10 s at 10M rows.
 * Credentials no longer appear on server command lines for the new job (environment / stdin only).
+* Tried and rejected: loading staged ranges with `COPY ... FROM PROGRAM` (batched multi-row inserts). In isolation
+  it loads 23M rows 23 % faster than `INSERT ... SELECT`, but inside the running job (20 workers competing for CPU,
+  I/O and WAL) it gave no gain at 10M and cost extra start-up at small sizes, so the simpler path stays.
 
 ## 7. Reproduce
 
