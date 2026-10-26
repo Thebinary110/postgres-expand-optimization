@@ -16,6 +16,11 @@ generator; every run starts from an identical database snapshot.
 | 100,000 | 6.45 s | **1.88 s** | 3.4× | byte-identical, including every generated identity value |
 | 1,000,000 | 59.5 s | **9.9 s** | 6.0× | byte-identical, including every generated identity value |
 | 10,000,000 | 10 min 12 s | **1 min 49 s** | 5.6× | identical rows (logical fingerprint); see §5 for identity values |
+| 50,000,000 | 59 min 43 s | **9 min 32 s** | 6.3× | identical rows; `table2` (116M rows) and `table5` byte-identical incl. identity values |
+
+The speed-up grows with size: the original slows down faster than linearly (its `table2` insert: 5 min at 10M,
+26 min at 50M), while this solution stays close to linear (at 50M the 100 GB source no longer fits in the
+server's 32 GB, so scans come from disk).
 
 Output equality is checked with `bench/fingerprint.sql`: an *exact* hash of every table (all columns, surrogate
 keys included) and a *logical* hash (surrogate keys replaced by natural keys), plus the row-counter table.
@@ -26,6 +31,9 @@ keys included) and a *logical* hash (surrogate keys replaced by natural keys), p
 |---|---:|---:|---:|---:|
 | original | 0.34 GB | 0.65 GB | – | 8.6 GB |
 | this solution | 2.6 GB | 0.65 GB | 4.9 GB (≈ one extra copy of the output) | 6.4 GB |
+
+At 50M rows this solution peaked at 2.2 GB process memory, 3.5 GB spill files, 24.7 GB staging and 9.1 GB WAL.
+Fingerprints beyond 10M use `bench/fingerprint_large.sql` (bucketed: whole-table strings exceed the 1 GB limit).
 
 Test server: PostgreSQL 16 in Docker (16 CPU quota, 32 GB, `shared_buffers=4GB`) on an ARM machine with 20 cores;
 see `bench/server/`.
@@ -147,7 +155,8 @@ Mechanisms:
 * **Cleanup** — staging schemas are dropped after the commit; abandoned jobs (different recipes, changed data) are
   cleaned up before a new job starts. Job and staging schemas are hidden from the table list.
 
-Tested (1M rows): client killed mid-run → server committed, reconnect registered (identical data); runner killed
+Tested at 50M rows in a real failure (a worker-liveness check misfired, since fixed): the interrupted job resumed
+from 711 of 842 checkpoints, stopped the previous attempt's leftover workers first, and committed. Tested (1M rows): client killed mid-run → server committed, reconnect registered (identical data); runner killed
 mid-wave → 102/122 checkpoints kept, destinations untouched (0 rows), resume recomputed only the missing ranges,
 result byte-identical; client killed after the commit → registered once on reconnect, a second reconnect is a no-op.
 
