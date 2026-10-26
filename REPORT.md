@@ -155,10 +155,30 @@ Mechanisms:
 * **Cleanup** — staging schemas are dropped after the commit; abandoned jobs (different recipes, changed data) are
   cleaned up before a new job starts. Job and staging schemas are hidden from the table list.
 
-Tested at 50M rows in a real failure (a worker-liveness check misfired, since fixed): the interrupted job resumed
-from 711 of 842 checkpoints, stopped the previous attempt's leftover workers first, and committed. Tested (1M rows): client killed mid-run → server committed, reconnect registered (identical data); runner killed
-mid-wave → 102/122 checkpoints kept, destinations untouched (0 rows), resume recomputed only the missing ranges,
-result byte-identical; client killed after the commit → registered once on reconnect, a second reconnect is a no-op.
+* **Abandoned jobs** — when the source or recipes changed, the old job's checkpoints are dropped and its identity
+  reservations are given back (only if no committed value lies beyond them), so the fresh job numbers exactly as a
+  first run would.
+* **Concurrent reconnects** — the registry row is locked before the exactly-once check, so two clients recovering
+  the same job at once register it once.
+
+**Validation on the final code** (`bench/recovery_suite.sh`, 1M rows; each scenario is compared with the untouched
+original's exact output fingerprint and version-registry fingerprint; log in `bench/evidence/`):
+
+| # | Injected failure | Result |
+|---|---|---|
+| S0 | none | identical (9.6 s vs 58.2 s) |
+| S1 | client killed mid-run | server committed; reconnect registered; identical |
+| S2 | client lost after the commit; two clients reconnect at once | registered exactly once; identical |
+| S3 | job killed at 1 s / 3 s / 5 s (52, 102, 122 of 122 checkpoints; 0 destination rows) | resumed; identical |
+| S4 | Cancel at 3 s (98/122 checkpoints, 0 rows) | resumed; identical |
+| S5 | PostgreSQL crash at 3 s | resumed; identical |
+| S6 | job killed, then crash (112 checkpointed unlogged tables emptied) | recomputed; identical |
+| S7 | job killed, then a new raw row ingested | old job abandoned; identical to the original on the new data |
+| S8 | second client starts while the first runs | refused ("still running"); first finishes identical |
+| S9 | expansion repeated on expanded tables | refused like the original; destinations and versions unchanged |
+
+Also observed at 50M rows in a real failure (a worker-liveness check misfired, since fixed): the interrupted job
+resumed from 711 of 842 checkpoints, stopped the previous attempt's leftover workers first, and committed.
 
 ## 5. Identity values at large sizes
 
@@ -179,6 +199,11 @@ from the catalog and, below it, reproduces the original exactly (including hash-
   row-counter table.
 * Parallel execution needs PostgreSQL ≥ 14 (TID range scans) and `CREATE` on the database; otherwise, and for
   statements that are not provably row-local, the original serial batch runs (with the same recovery).
+* Identity values follow the source's physical order (= `raw_id` order for generated and append-only raw data). If
+  a `raw_data` row is updated in place it moves; the rows stay identical, but `table2` / `table5` surrogate keys
+  can then differ from the original's, whose merge-join plan reads those inserts in `raw_id` order.
+* A failed attempt keeps its staging schema (that is what makes the resume possible) until the next expansion of
+  the database resumes or abandons it.
 * Validating a foreign key that references the source reads the source heap unless its visibility map is set
   (autovacuum); about 10 s at 10M rows.
 * Credentials no longer appear on server command lines for the new job (environment / stdin only).
@@ -193,6 +218,8 @@ bench/server/            PostgreSQL 16 + OpenSSH + psql server image used for te
 bench/headless_expand.py headless Expand with the GUI's report formatter; credentials via PDM_* env vars
 bench/fingerprint.sql    exact + logical output fingerprints
 bench/monitor.sh         peak memory / spill / staging / WAL sampler
+bench/control_fingerprint.sql  version-registry fingerprint (versions + dependencies, volatile fields excluded)
+bench/recovery_suite.sh  failure scenarios S0-S9 against the untouched original (evidence in bench/evidence/)
 tests/test_fast_expansion.py  statement analysis, rewriting, planning and rendering tests
 ```
 

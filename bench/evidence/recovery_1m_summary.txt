@@ -1,0 +1,52 @@
+[17:48:20] == references: untouched original code on snapshot 1m
+[17:49:27]   MEASURED PROCESSING TOTAL: 58.218 s
+[17:50:34] == S0 clean run
+[17:50:48]   MEASURED PROCESSING TOTAL: 9.615 s
+[17:50:52] PASS S0 (registry=[registered] data=[committed])
+[17:50:52] == S1 client killed mid-execution (laptop/SSH lost); reconnect registers
+[17:50:59]   client killed at units 66/122; waiting for the detached job
+[17:51:06]   job finished on its own: registry=[registered] data=[committed]
+[17:51:10] PASS S1 (registry=[registered] data=[committed])
+[17:51:10] == S2 client lost after the data commit, before registration; two clients reconnect at the same time
+[17:51:24]   after commit: registry=[submitted] data=[committed]
+[17:51:25]   recoveries: 1 (must be 1)
+[17:51:30] PASS S2 (registry=[registered] data=[committed])
+[17:51:30] == S3_1s server-side job killed 1s into execution; same expansion run again resumes
+killed 2ff5a93a2b3d4346
+[17:51:36]   after kill: units 52/122, destination rows 0 (must be 0), registry=[submitted] data=[running]
+[17:51:47]   MEASURED PROCESSING TOTAL: 10.042 s
+[17:51:51] PASS S3_1s (registry=[registered] data=[committed])
+[17:51:51] == S3_3s server-side job killed 3s into execution; same expansion run again resumes
+killed e3a16d1ab9c248ee
+[17:51:59]   after kill: units 102/122, destination rows 0 (must be 0), registry=[submitted] data=[running]
+[17:52:09]   MEASURED PROCESSING TOTAL: 8.636 s
+[17:52:13] PASS S3_3s (registry=[registered] data=[committed])
+[17:52:13] == S3_5s server-side job killed 5s into execution; same expansion run again resumes
+killed d8f162ce24c14108
+[17:52:23]   after kill: units 122/122, destination rows 0 (must be 0), registry=[submitted] data=[running]
+[17:52:31]   MEASURED PROCESSING TOTAL: 6.646 s
+[17:52:35] PASS S3_5s (registry=[registered] data=[committed])
+[17:52:35] == S4 user presses Cancel 3s into execution; same expansion run again
+[17:52:42]   attempt exit: services.postgres_service.OperationCancelledError: Operacao cancelada pelo usuario.
+[17:52:43]   after cancel: units 98/122, destination rows 0 (must be 0), registry=[submitted] data=[running]
+[17:52:56] PASS S4 (registry=[registered] data=[committed])
+[17:52:56] == S5 PostgreSQL crash (backend SIGKILL -> postmaster reset) 3s into execution
+[17:53:06]   after crash: units 102/122, destination rows 0 (must be 0), registry=[submitted] data=[running]
+[17:53:22] PASS S5 (registry=[registered] data=[committed])
+[17:53:22] == S6 job killed 4s in, then PostgreSQL crash (empties checkpointed UNLOGGED staging)
+killed 2948398b95b64639
+[17:53:31]   checkpoints before crash: 112/122
+[17:53:34]   after crash: units 112/122, destination rows 0 (must be 0)
+[17:53:50] PASS S6 (registry=[registered] data=[committed])
+[17:53:50] == S7 job killed 3s in, then a raw row is ingested; the rerun must not reuse checkpoints
+killed 157abd5d1eca456b
+[17:53:59]   source changed; units 102/122
+[17:54:14] PASS S7 (registry=[abandoned,registered] data=[abandoned,committed])
+[17:54:14] == S8 a second client starts the same expansion while the first is running
+[17:54:28]   second client: still running on the server for kaggle_challenge
+[17:54:32] PASS S8 (registry=[registered] data=[committed])
+[17:54:32] == S9 the expansion is run again on already expanded destinations (original first, then this code)
+[17:54:38]   original: ERROR:  duplicate key value violates unique constraint "table4_pkey"
+[17:54:44]   this code: ERROR:  Parallel expansion offsets are incomplete or inconsistent.
+[17:54:48] PASS S9 (both refused, destinations and versions unchanged; registry=[registered,submitted] data=[committed,running]; staging schemas 1)
+[17:54:48] == RESULT: 12 passed, 0 failed
