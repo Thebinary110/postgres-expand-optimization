@@ -13915,6 +13915,7 @@ SELECT json_build_object(
             lines.append(
                 f"PGUSER={user} PGDATABASE={shlex.quote(database_name)} psql -h localhost -X -q -c "
                 + shlex.quote(
+                    fast_expansion.abandon_sequences_sql(job_id) + " "
                     f"DROP SCHEMA IF EXISTS {stage} CASCADE; "
                     f"DELETE FROM {sql_ident(fast_expansion.JOB_SCHEMA)}.units WHERE job_id = {sql_literal(job_id)}; "
                     f"UPDATE {sql_ident(fast_expansion.JOB_SCHEMA)}.jobs SET state = 'abandoned', "
@@ -13972,6 +13973,11 @@ ON CONFLICT (job_id) DO UPDATE SET state = 'submitted', updated_at = now();
             raise
         except RuntimeError as exc:
             details = re.sub(r"PGDM_JOB_FAILED \d+\s*", "", str(exc)).strip()
+            # the root cause (a worker or index step) first; the coordinator's own error is its consequence
+            lines = details.splitlines()
+            cause = [line for line in lines if "ERROR:" in line and "/coordinator.sql:" not in line]
+            if cause:
+                details = "\n".join(cause + [line for line in lines if line not in cause])
             raise RuntimeError(
                 "The expansion was not committed (the server-side job stopped before its single commit). "
                 "Completed checkpoints were kept: running the same expansion again resumes from them."
@@ -14028,13 +14034,18 @@ ON CONFLICT (job_id) DO UPDATE SET state = 'submitted', updated_at = now();
                 "timing_report": report,
                 "job_id": row["job_id"],
             }
-            versions = self.register_cross_table_expansion_versions(
-                expansion_result=expansion_result,
-                requested_by=row.get("requested_by") or "recovered expansion",
-                workstation_name=row.get("workstation_name") or "recovered",
-                progress_callback=progress_callback,
-                timing_report=report,
-            )
+            try:
+                versions = self.register_cross_table_expansion_versions(
+                    expansion_result=expansion_result,
+                    requested_by=row.get("requested_by") or "recovered expansion",
+                    workstation_name=row.get("workstation_name") or "recovered",
+                    progress_callback=progress_callback,
+                    timing_report=report,
+                )
+            except RuntimeError as exc:
+                if "has already been registered" in str(exc):
+                    continue  # another session recovered it concurrently
+                raise
             recovered.append({"job_id": row["job_id"], "database_name": database_name, "versions": versions})
         return recovered
 
@@ -15943,10 +15954,11 @@ FROM inserted_version;
                 f"""
 DO $pgdm_job_registered$
 BEGIN
-    IF EXISTS (
-        SELECT 1 FROM {CONTROL_SCHEMA_IDENT}.expansion_jobs
-        WHERE job_id = {sql_literal(expansion_job_id)} AND state = 'registered'
-    ) THEN
+    -- the row lock makes concurrent recoveries of one job wait, then see the winner's 'registered'
+    IF (
+        SELECT state FROM {CONTROL_SCHEMA_IDENT}.expansion_jobs
+        WHERE job_id = {sql_literal(expansion_job_id)} FOR UPDATE
+    ) IS NOT DISTINCT FROM 'registered' THEN
         RAISE EXCEPTION 'Expansion job % has already been registered.', {sql_literal(expansion_job_id)};
     END IF;
 END

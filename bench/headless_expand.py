@@ -17,6 +17,7 @@ import json
 import os
 import socket
 import sys
+import threading
 import types
 from datetime import datetime
 from pathlib import Path
@@ -65,6 +66,8 @@ def main():
     ap.add_argument("--skip-register", action="store_true",
                     help="stop right after the data commit (simulates a client lost before version registration)")
     ap.add_argument("--recover-only", action="store_true", help="only finish pending registrations, then exit")
+    ap.add_argument("--cancel-after", type=float, default=None,
+                    help="press Cancel this many seconds after the expansion starts (the GUI's cancel_event)")
     args = ap.parse_args()
 
     _stub_gui_modules()
@@ -98,9 +101,14 @@ def main():
     extra = {}
     if "job_context" in inspect.signature(service.execute_cross_table_expansion).parameters:
         extra["job_context"] = {"requested_by": args.author, "workstation_name": socket.gethostname()}
+    cancel_event = threading.Event()
+    if args.cancel_after is not None:
+        timer = threading.Timer(args.cancel_after, cancel_event.set)
+        timer.daemon = True
+        timer.start()
     result = service.execute_cross_table_expansion(
         database_name=args.database, source_full_table_name=args.source, raw_schemas=raw_schemas,
-        destinations=destinations, cancel_event=None, **extra,
+        destinations=destinations, cancel_event=cancel_event, **extra,
         progress_callback=lambda stage, pct, msg: print(f"[{stage} {pct:>3}%] {msg}", flush=True),
         post_commit_callback=lambda *a, **k: None, timing_report=report)
     if args.skip_register:

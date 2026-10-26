@@ -421,6 +421,32 @@ def restore_sequences_sql(job_id: str, sequences: list[str]) -> str:
         "WHERE s.v IS NOT NULL \\g /dev/null" for seq in sequences)
 
 
+def abandon_sequences_sql(job_id: str) -> str:
+    """An abandoned job's setval reservations are given back (its staged rows are never committed), so the
+    next job numbers exactly as a fresh run would; skipped for a column that already holds a value at or
+    beyond the restored position."""
+    return f"""DO $pgdm_abandon$
+DECLARE r record; owner_table regclass; owner_column name; inc bigint; mx bigint;
+BEGIN
+    IF to_regclass('{JOB_SCHEMA}.jobs') IS NULL THEN RETURN; END IF;
+    FOR r IN SELECT s.key AS seq, s.value AS v FROM {qi(JOB_SCHEMA)}.jobs j, jsonb_each(j.payload->'sequences') s
+             WHERE j.job_id = {ql(job_id)} AND j.state <> 'committed' AND to_regclass(s.key) IS NOT NULL LOOP
+        SELECT d.refobjid::regclass, a.attname, q.seqincrement INTO owner_table, owner_column, inc
+        FROM pg_depend d JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid
+        JOIN pg_sequence q ON q.seqrelid = d.objid
+        WHERE d.classid = 'pg_class'::regclass AND d.objid = to_regclass(r.seq) AND d.deptype IN ('a', 'i');
+        CONTINUE WHEN owner_table IS NULL OR inc <= 0;
+        EXECUTE format('SELECT max(%I)::bigint FROM %s', owner_column, owner_table) INTO mx;
+        IF (mx IS NULL OR mx < (CASE WHEN (r.v->>1)::boolean THEN (r.v->>0)::bigint + inc ELSE (r.v->>0)::bigint END)) THEN
+            PERFORM setval(r.seq, (r.v->>0)::bigint, (r.v->>1)::boolean);
+        END IF;
+    END LOOP;
+EXCEPTION WHEN others THEN
+    RAISE WARNING 'identity sequences of abandoned job % kept: %', {ql(job_id)}, SQLERRM;  -- gaps only
+END
+$pgdm_abandon$;"""
+
+
 def commit_marker_sql(job_id: str, manifest_sql: str) -> str:
     """Inside the expansion transaction: refuse to finish a resumed job whose source changed, store the
     manifest (what the version registration needs) and mark the job committed atomically with the data."""
