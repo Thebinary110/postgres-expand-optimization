@@ -13906,6 +13906,10 @@ SELECT json_build_object(
         that lets any later session finish its version registration), start the detached runner."""
         user = shlex.quote(self.sql_username)
         lines = ["set -u"]
+        # leftovers of an interrupted attempt of this job (or of abandoned jobs) never run alongside it
+        for job_id in [job["job_id"]] + job["abandon"]:
+            job_path = shlex.quote(f"{REMOTE_STORAGE_DIR}/expand_jobs/{job_id}/")
+            lines.append(f"pkill -TERM -f {job_path} 2>/dev/null; true")
         for job_id in job["abandon"]:
             stage = sql_ident(fast_expansion.STAGE_SCHEMA_PREFIX + job_id)
             lines.append(

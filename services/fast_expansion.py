@@ -459,6 +459,8 @@ def runner_script(job_dir: str, files: dict, env: dict) -> str:
                  'psql -X -qAt -v ON_ERROR_STOP=1 -f "$d/coordinator.sql" >"$d/coordinator.out" 2>"$d/coordinator.err"\n'
                  'status=$?\n'
                  'if [ $status -ne 0 ] && [ -s "$d/workers.log" ]; then grep -m 20 -E "ERROR|FAILED" "$d/workers.log" >>"$d/coordinator.err"; fi\n'
+                 # a failed coordinator leaves no phase running behind it (finished checkpoints stay resumable)
+                 'if [ $status -ne 0 ]; then pkill -TERM -f "$d/phase.sh" 2>/dev/null; pkill -TERM -f "$d/w[0-9]" 2>/dev/null; fi\n'
                  'echo $status > "$d/status.tmp" && mv "$d/status.tmp" "$d/status"\n'
                  'PGDM_RUN_EOF')
     lines.append('setsid nohup bash "$d/run.sh" </dev/null >/dev/null 2>&1 & echo $! > "$d/pid"')
@@ -1232,7 +1234,9 @@ BEGIN
         IF EXISTS (SELECT 1 FROM {qi(xs)}.phase_done WHERE phase = {ql(phase_key)}) THEN
             RAISE EXCEPTION 'Parallel expansion ranges did not complete: %', {ql(", ".join(unit_ids))};
         END IF;
-        -- the workers vanished (killed with their phase): stop waiting; the checkpoints stay resumable
+        -- the workers vanished (killed with their phase): stop waiting; the checkpoints stay resumable.
+        -- (pg_stat_activity is cached per transaction; this transaction is long, so refresh it each time)
+        PERFORM pg_stat_clear_snapshot();
         IF EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = {ql('pgdm_worker_' + job_id)}) THEN
             pgdm_last_worker := clock_timestamp();
         ELSIF clock_timestamp() - pgdm_last_worker > interval '10 seconds' THEN

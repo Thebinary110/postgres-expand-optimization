@@ -11,23 +11,21 @@ Measured with the application's own **Expansion Performance Report** (`MEASURED 
 headlessly (`bench/headless_expand.py`, same service calls as the GUI). Datasets from the unmodified official
 generator; every run starts from an identical database snapshot.
 
-| Rows | Original | This solution | Speed-up | Output vs original |
+| Rows | Original (untouched code) | This solution | Speed-up | Output vs original |
 |---:|---:|---:|---:|---|
-| 100,000 | 6.45 s | **2.37 s** | 2.7× | byte-identical, including every generated identity value |
-| 1,000,000 | 59.5 s | **11.4 s** | 5.2× | byte-identical, including every generated identity value |
-| 10,000,000 | 10 min 57 s ¹ | **1 min 57 s** | 5.6× | identical rows (logical fingerprint); see §5 for identity values |
-
-¹ At 10M the reference is the original serial SQL batch run through the new job runner; at 100k and 1M the
-reference is the untouched original code.
+| 100,000 | 6.45 s | **1.88 s** | 3.4× | byte-identical, including every generated identity value |
+| 1,000,000 | 59.5 s | **9.9 s** | 6.0× | byte-identical, including every generated identity value |
+| 10,000,000 | 10 min 12 s | **1 min 49 s** | 5.6× | identical rows (logical fingerprint); see §5 for identity values |
 
 Output equality is checked with `bench/fingerprint.sql`: an *exact* hash of every table (all columns, surrogate
 keys included) and a *logical* hash (surrogate keys replaced by natural keys), plus the row-counter table.
 
 **Resources at 10M rows** (`bench/monitor.sh`, sampled every 0.5 s):
 
-| Peak process memory (anonymous) | Peak spill files (`pgsql_tmp`) | Peak staging tables | Peak WAL |
-|---:|---:|---:|---:|
-| 2.7 GB | 0.65 GB | 4.9 GB (≈ one extra copy of the output) | 6.4 GB |
+| Run | Peak process memory (anonymous) | Peak spill files (`pgsql_tmp`) | Peak staging tables | Peak WAL |
+|---|---:|---:|---:|---:|
+| original | 0.34 GB | 0.65 GB | – | 8.6 GB |
+| this solution | 2.6 GB | 0.65 GB | 4.9 GB (≈ one extra copy of the output) | 6.4 GB |
 
 Test server: PostgreSQL 16 in Docker (16 CPU quota, 32 GB, `shared_buffers=4GB`) on an ARM machine with 20 cores;
 see `bench/server/`.
@@ -103,6 +101,17 @@ referenced table `ACCESS EXCLUSIVE`.)
 references, function safety, destination existence, managed dependencies, row counters with the same reconcile
 logic) in one SSH command with one psql session per database. Same checks, same order, same error messages.
 
+**JSON path hoisting** — in worker statements every `alias.col -> 'p' ->> 'k'` / `alias.col ->> 'k'` on a json/jsonb
+source column that is a complete operand (checked against PostgreSQL operator precedence on both sides) is
+computed once per source row in narrow columns: the sub-object once, each key once, behind `OFFSET 0` fences, and
+the wide JSON column is dropped from the rows when every use was hoisted. json/jsonb `->`/`->>` with text keys
+are immutable and cannot fail, so this is equivalent to evaluating them at each use. (`table2` alone performs 56
+lookups per source row; 1M: −14 %.)
+
+**Plan-independent order** — rows of one source row are staged ordered by source position, then by their own
+values in the destination types, then emission order, so identity values never depend on the join strategy a
+worker's planner picks (a hash join may emit rows that share a key in reverse).
+
 **Planner hints** — worker sessions and FK validation use `random_page_cost = 1.1` (staged data is cached / on SSD):
 joins of a range against the staged `table1` become index lookups instead of a full re-hash per range
 (at 10M this cut spill files from 20 GB to 0.65 GB). Cost hints only; results are unchanged.
@@ -119,7 +128,9 @@ joins of a range against the staged `table1` become index lookups instead of a f
 
 Mechanisms:
 * **Detached runner** — the job runs under `setsid nohup` on the server; the client waits for it there. Losing
-  SSH does not touch it.
+  SSH does not touch it. If the coordinator's own psql dies, its backend notices within a second
+  (`client_connection_check_interval`) and rolls back; a coordinator waiting for ranges stops if the job's workers
+  (tagged by `application_name`) vanish; worker sessions use `lock_timeout`, so a lock-order bug fails resumably.
 * **Job registry (outbox)** — `app_control.expansion_jobs` in the control database records each job with everything
   needed to finish its registration. The data commit also marks the data-side job `committed` (same transaction as
   the data). `recover_pending_expansions()` runs on every connect and registers committed-but-unregistered jobs;
@@ -142,7 +153,9 @@ result byte-identical; client killed after the commit → registered once on rec
 
 ## 5. Identity values at large sizes
 
-Up to 1M rows the output matches the original byte for byte, surrogate keys included. Above a quarter of
+Up to 1M rows the output matches the original byte for byte, surrogate keys included. At 10M two runs of the
+original SQL itself (untouched code, and the same batch inside the job runner) produced the same rows with
+different surrogate keys. Above a quarter of
 `shared_buffers` PostgreSQL synchronises sequential scans: a new scan of the source starts where an earlier one
 left off. The original's own `table1` insert therefore starts mid-table (observed at 10M: the first identity value
 goes to `raw_id` 9,997,633) and its identity values depend on earlier scans, not on the data. Above that threshold
