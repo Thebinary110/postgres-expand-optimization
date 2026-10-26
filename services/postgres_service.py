@@ -9187,6 +9187,20 @@ SET version_history_format = CASE
     ELSE 'full'
 END
 WHERE version_history_format IS NULL;
+
+CREATE TABLE IF NOT EXISTS {CONTROL_SCHEMA_IDENT}.expansion_jobs (
+    job_id text PRIMARY KEY,
+    database_name text NOT NULL,
+    source_table_name text NOT NULL,
+    signature text NOT NULL,
+    state text NOT NULL,
+    requested_by text,
+    workstation_name text,
+    payload jsonb NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    updated_at timestamptz NOT NULL DEFAULT now(),
+    registered_at timestamptz
+);
 """
         if CONTROL_SCHEMA != LEGACY_CONTROL_SCHEMA:
             sql += f"""
@@ -10585,6 +10599,8 @@ WHERE raw_dump_path = {sql_literal(dump_path)};
                 "FROM pg_tables "
                 f"WHERE schemaname NOT IN ('pg_catalog', 'information_schema', {sql_literal(LEGACY_CONTROL_SCHEMA)}) "
                 f"AND NOT (schemaname = 'public' AND tablename = {sql_literal(DATA_TABLE_ROW_COUNTS_NAME)}) "
+                f"AND schemaname <> {sql_literal(fast_expansion.JOB_SCHEMA)} "
+                f"AND schemaname NOT LIKE {sql_literal(fast_expansion.STAGE_SCHEMA_PREFIX.replace('_', chr(92) + '_') + '%')} "
                 "ORDER BY schemaname, tablename;"
             )
         else:
@@ -10593,6 +10609,8 @@ WHERE raw_dump_path = {sql_literal(dump_path)};
                 "FROM pg_tables "
                 f"WHERE schemaname NOT IN ('pg_catalog', 'information_schema', {sql_literal(CONTROL_SCHEMA)}, {sql_literal(LEGACY_CONTROL_SCHEMA)}) "
                 f"AND NOT (schemaname = 'public' AND tablename = {sql_literal(DATA_TABLE_ROW_COUNTS_NAME)}) "
+                f"AND schemaname <> {sql_literal(fast_expansion.JOB_SCHEMA)} "
+                f"AND schemaname NOT LIKE {sql_literal(fast_expansion.STAGE_SCHEMA_PREFIX.replace('_', chr(92) + '_') + '%')} "
                 "ORDER BY schemaname, tablename;"
             )
 
@@ -13815,6 +13833,203 @@ SELECT json_build_object(
 )::text;
 """.strip()
 
+    # ------------------------------------------------------------------ recoverable expansion jobs
+    @staticmethod
+    def _expansion_token_sql(source_schema_name: str, source_table_name: str, destinations) -> str:
+        """Change token of the source and destinations, recorded when a job starts and compared before it
+        is resumed: write counters of the source (the job never writes it), and the managed row counters
+        plus update/delete counters of the destinations (aborted job inserts do not change these)."""
+        def stat(schema_name, table_name, columns):
+            return (
+                f"(SELECT jsonb_build_array({', '.join(columns)}) FROM pg_stat_all_tables "
+                f"WHERE schemaname = {sql_literal(schema_name)} AND relname = {sql_literal(table_name)})"
+            )
+        parts = [
+            f"jsonb_build_object({sql_literal(f'{schema_name}.{table_name}')}, jsonb_build_array("
+            f"(SELECT row_count FROM {DATA_TABLE_ROW_COUNTS} WHERE schema_name = {sql_literal(schema_name)} "
+            f"AND table_name = {sql_literal(table_name)}), "
+            f"{stat(schema_name, table_name, ['n_tup_upd', 'n_tup_del'])}))"
+            for schema_name, table_name in destinations
+        ]
+        return (
+            "jsonb_build_object('source', "
+            f"{stat(source_schema_name, source_table_name, ['n_tup_ins', 'n_tup_upd', 'n_tup_del'])}, "
+            f"'destinations', {' || '.join(parts) or chr(39) + '{}' + chr(39) + '::jsonb'})"
+        )
+
+    def _choose_expansion_job(self, database_name: str, signature_value: str, new_job_id: str, jobs_info) -> dict:
+        """Resume the interrupted job with the same recipes if its checkpoints are still valid; abandon
+        (clean up) every other unfinished job of this database."""
+        result = {"job_id": new_job_id, "resume": False, "abandon": []}
+        if not jobs_info:
+            return result
+        data_jobs = jobs_info.get("data_jobs") or {}
+        alive = set(jobs_info.get("alive") or [])
+        current_token = jobs_info.get("token")
+        for row in jobs_info.get("registry") or []:
+            job_id = row.get("job_id")
+            data_job = data_jobs.get(job_id) or {}
+            if job_id in alive:
+                raise RuntimeError(
+                    f"Expansion job {job_id} is still running on the server for {database_name}. "
+                    "Wait for it to finish; it will be registered automatically."
+                )
+            if data_job.get("state") == "committed":
+                continue  # finished but not yet registered: handled by recover_pending_expansions()
+            if (
+                not result["resume"]
+                and row.get("signature") == signature_value
+                and data_job.get("state") == "running"
+                and data_job.get("token") == current_token
+            ):
+                result.update(job_id=job_id, resume=True)
+            else:
+                result["abandon"].append(job_id)
+        return result
+
+    def _start_expansion_job(
+        self,
+        database_name: str,
+        source_full_table_name: str,
+        job: dict,
+        signature_value: str,
+        registry_payload: dict,
+        job_context: dict,
+        runner: str,
+        cancel_event=None,
+    ):
+        """One SSH command: clean up abandoned jobs, record the job in the control registry (the outbox
+        that lets any later session finish its version registration), start the detached runner."""
+        user = shlex.quote(self.sql_username)
+        lines = ["set -u"]
+        for job_id in job["abandon"]:
+            stage = sql_ident(fast_expansion.STAGE_SCHEMA_PREFIX + job_id)
+            lines.append(
+                f"PGUSER={user} PGDATABASE={shlex.quote(database_name)} psql -h localhost -X -q -c "
+                + shlex.quote(
+                    f"DROP SCHEMA IF EXISTS {stage} CASCADE; "
+                    f"DELETE FROM {sql_ident(fast_expansion.JOB_SCHEMA)}.units WHERE job_id = {sql_literal(job_id)}; "
+                    f"UPDATE {sql_ident(fast_expansion.JOB_SCHEMA)}.jobs SET state = 'abandoned', "
+                    f"updated_at = clock_timestamp() WHERE job_id = {sql_literal(job_id)};"
+                )
+                + " </dev/null"
+            )
+            lines.append(f"rm -rf {shlex.quote(f'{REMOTE_STORAGE_DIR}/expand_jobs/{job_id}')}")
+        registry_sql = ""
+        if job["abandon"]:
+            registry_sql += (
+                f"UPDATE {CONTROL_SCHEMA_IDENT}.expansion_jobs SET state = 'abandoned', updated_at = now() "
+                f"WHERE job_id IN ({', '.join(sql_literal(j) for j in job['abandon'])});\n"
+            )
+        registry_sql += f"""
+INSERT INTO {CONTROL_SCHEMA_IDENT}.expansion_jobs (
+    job_id, database_name, source_table_name, signature, state, requested_by, workstation_name, payload
+) VALUES (
+    {sql_literal(job['job_id'])}, {sql_literal(database_name)}, {sql_literal(source_full_table_name)},
+    {sql_literal(signature_value)}, 'submitted', {sql_literal(job_context.get('requested_by'))},
+    {sql_literal(job_context.get('workstation_name'))},
+    {sql_literal(json.dumps(registry_payload, ensure_ascii=False, default=list))}::jsonb
+)
+ON CONFLICT (job_id) DO UPDATE SET state = 'submitted', updated_at = now();
+"""
+        lines.append(
+            f"PGUSER={user} PGDATABASE={shlex.quote(CONTROL_DB)} psql -h localhost -X -q -v ON_ERROR_STOP=1 "
+            f"<<'PGDM_REGISTRY_EOF' || exit 3\n{registry_sql}\nPGDM_REGISTRY_EOF"
+        )
+        lines.append(runner)
+        output = self.run_remote_command("bash -s", stdin_text="\n".join(lines) + "\n", cancel_event=cancel_event)
+        if "PGDM_JOB_STARTED" not in output:
+            raise RuntimeError("The server-side expansion job could not be started.\n" + output)
+
+    def _wait_expansion_job(self, job_dir: str, cancel_event=None) -> str:
+        """Wait (on the server) for the detached runner; return the coordinator output. Cancelling stops
+        the job's whole process group: the transaction rolls back and the checkpoints stay resumable."""
+        d = shlex.quote(job_dir)
+        command = (
+            f"d={d}; pid=$(cat \"$d/pid\"); "
+            "while kill -0 \"$pid\" 2>/dev/null; do sleep 0.05; done; "
+            "st=$(cat \"$d/status\" 2>/dev/null || echo 255); "
+            "if [ \"$st\" != 0 ]; then echo \"PGDM_JOB_FAILED $st\" >&2; "
+            "cat \"$d/coordinator.err\" >&2 2>/dev/null; exit 1; fi; "
+            "cat \"$d/coordinator.out\"; rm -rf \"$d\""
+        )
+        try:
+            return self.run_remote_command(command, cancel_event=cancel_event)
+        except OperationCancelledError:
+            self.run_remote_command(
+                f"p=$(cat {d}/pid); tr '\\0' ' ' < /proc/$p/cmdline 2>/dev/null | grep -q '/run.sh' "
+                "&& kill -TERM -- -$p 2>/dev/null; true",
+                cancel_event=None,
+            )
+            raise
+        except RuntimeError as exc:
+            details = re.sub(r"PGDM_JOB_FAILED \d+\s*", "", str(exc)).strip()
+            raise RuntimeError(
+                "The expansion was not committed (the server-side job stopped before its single commit). "
+                "Completed checkpoints were kept: running the same expansion again resumes from them."
+                + (f"\n\n{details}" if details else "")
+            ) from exc
+
+    def recover_pending_expansions(self, progress_callback=None) -> list[dict]:
+        """Finish every expansion whose data was committed but whose versions were never registered (the
+        client lost its connection or crashed in between). Safe to call at any time: the registration
+        marks the job registered in the same control transaction, so it happens exactly once."""
+        rows = self._run_control_json_query(
+            f"SELECT COALESCE(json_agg(json_build_object('job_id', job_id, 'database_name', database_name, "
+            f"'requested_by', requested_by, 'workstation_name', workstation_name, 'payload', payload) "
+            f"ORDER BY created_at), '[]'::json)::text FROM {CONTROL_SCHEMA_IDENT}.expansion_jobs "
+            "WHERE state = 'submitted';"
+        ) or []
+        recovered = []
+        for row in rows:
+            database_name = row["database_name"]
+            output = self.run_remote_command(
+                f"PGUSER={shlex.quote(self.sql_username)} PGDATABASE={shlex.quote(database_name)} "
+                "psql -h localhost -X -qAt -c "
+                + shlex.quote(
+                    f"SELECT json_build_object('state', state, 'manifest', payload->'manifest')::text "
+                    f"FROM {sql_ident(fast_expansion.JOB_SCHEMA)}.jobs WHERE job_id = {sql_literal(row['job_id'])} "
+                    "AND to_regclass('pgdm_expansion.jobs') IS NOT NULL"
+                )
+                + " 2>/dev/null; true"
+            ).strip()
+            try:
+                data_job = json.loads(output.splitlines()[-1]) if output else {}
+            except json.JSONDecodeError:
+                data_job = {}
+            if data_job.get("state") != "committed" or not data_job.get("manifest"):
+                continue
+            payload = row["payload"]
+            report = self.create_cross_table_expansion_timing_report(
+                database_name,
+                f"{payload['source_schema_name']}.{payload['source_table_name']}",
+                payload["raw_schemas"],
+                [d["table_name"] for d in payload["destinations"]],
+            )
+            expansion_result = {
+                "source_database_name": database_name,
+                "source_schema_name": payload["source_schema_name"],
+                "source_table_name": payload["source_table_name"],
+                "raw_schemas": payload["raw_schemas"],
+                "source_versions": payload.get("source_versions") or [],
+                "dependency_manifest": data_job["manifest"],
+                "destinations": [
+                    {**d, "read_relations": [tuple(r) for r in d.get("read_relations") or []]}
+                    for d in payload["destinations"]
+                ],
+                "timing_report": report,
+                "job_id": row["job_id"],
+            }
+            versions = self.register_cross_table_expansion_versions(
+                expansion_result=expansion_result,
+                requested_by=row.get("requested_by") or "recovered expansion",
+                workstation_name=row.get("workstation_name") or "recovered",
+                progress_callback=progress_callback,
+                timing_report=report,
+            )
+            recovered.append({"job_id": row["job_id"], "database_name": database_name, "versions": versions})
+        return recovered
+
     def _batched_expansion_preflight(
         self,
         database_name: str,
@@ -13851,6 +14066,18 @@ WHERE database_name = {sql_literal(database_name)}
   AND table_name = {sql_literal(source_table_name)}
   AND raw_schema IN ({scope_sql});
 """
+            + "\\echo PGDM_SECTION registry\n"
+            + f"""
+SELECT COALESCE(json_agg(json_build_object('job_id', job_id, 'signature', signature) ORDER BY created_at),
+                '[]'::json)::text
+FROM {CONTROL_SCHEMA_IDENT}.expansion_jobs
+WHERE database_name = {sql_literal(database_name)} AND state = 'submitted';
+"""
+        )
+        token_sql = self._expansion_token_sql(
+            source_schema_name,
+            source_table_name,
+            [(schema_name, table_name) for schema_name, table_name, _full in destinations],
         )
         destination_values = ", ".join(
             f"({sql_literal(schema_name)}, {sql_literal(table_name)})"
@@ -13865,6 +14092,8 @@ WHERE database_name = {sql_literal(database_name)}
             "\\set ON_ERROR_STOP 1\n"
             "BEGIN;\nSET LOCAL client_min_messages = warning;\n"
             + self._data_table_row_counts_ddl_sql()
+            + "\n"
+            + fast_expansion.JOB_DDL
             + "\nCOMMIT;\n"
             # counters missing for existing destinations are reconciled exactly like
             # reconcile_table_row_count(): under SHARE ROW EXCLUSIVE, from an exact COUNT(*)
@@ -13914,11 +14143,23 @@ SELECT json_build_object(
                      FROM (VALUES {destination_values}) AS d(schema_name, table_name)),
     'dependencies', json_build_object({dependency_items})
 )::text;
+\\echo PGDM_SECTION data_jobs
+SELECT json_build_object(
+    'jobs', (SELECT COALESCE(json_object_agg(job_id, json_build_object('state', state, 'token', payload->'token')),
+                             '{{}}'::json)
+             FROM {sql_ident(fast_expansion.JOB_SCHEMA)}.jobs WHERE state IN ('running', 'committed')),
+    'token', {token_sql}
+)::text;
 """
             + plan_script
         )
         command = (
             "nproc 2>/dev/null || echo 1; "
+            # a job is alive only if its recorded pid still runs that job's own run.sh (pids are recycled)
+            f"for f in {shlex.quote(REMOTE_STORAGE_DIR)}/expand_jobs/*/pid; do "
+            "[ -f \"$f\" ] && p=\"$(cat \"$f\")\" && j=\"$(basename \"$(dirname \"$f\")\")\" && "
+            "tr '\\0' ' ' < \"/proc/$p/cmdline\" 2>/dev/null | grep -q \"expand_jobs/$j/run.sh\" && "
+            "echo \"PGDM_ALIVE $j\"; done; "
             f"PGUSER={shlex.quote(self.sql_username)} PGDATABASE={shlex.quote(CONTROL_DB)} "
             "psql -h localhost -X -qAt -f \"$pgdm_dir/control.sql\" </dev/null && "
             "echo PGDM_SECTION_DATA && "
@@ -13936,11 +14177,13 @@ SELECT json_build_object(
             stdin_text=payload,
             cancel_event=cancel_event,
         )
-        sections, current, cpu_count = {}, None, 1
+        sections, current, cpu_count, alive = {}, None, 1, []
         for line in output.splitlines():
             stripped = line.strip()
             if current is None and stripped.isdigit():
                 cpu_count = int(stripped)
+            elif stripped.startswith("PGDM_ALIVE "):
+                alive.append(stripped.split()[1])
             elif stripped.startswith("PGDM_SECTION") or stripped.startswith("PGDM_EXPLAIN ") or stripped == "PGDM_CATALOG":
                 current = stripped
             elif current is not None and stripped:
@@ -13950,11 +14193,22 @@ SELECT json_build_object(
             checks = json.loads(sections.get("PGDM_SECTION checks", ""))
         except json.JSONDecodeError as exc:
             raise RuntimeError("Could not read the batched preflight results.") from exc
+        try:
+            registry = json.loads(sections.get("PGDM_SECTION registry", "[]"))
+            data_jobs = json.loads(sections.get("PGDM_SECTION data_jobs", "{}"))
+        except json.JSONDecodeError:
+            registry, data_jobs = [], {}
         return {
             "cpu_count": cpu_count,
             "source_versions": [dict(item) for item in versions if isinstance(item, dict)],
             "checks": checks,
             "sections": sections,
+            "jobs": {
+                "registry": registry,
+                "data_jobs": data_jobs.get("jobs") or {},
+                "token": data_jobs.get("token"),
+                "alive": alive,
+            },
         }
 
     def _fast_plan_request(self, prepared: dict, source_schema_name: str, source_table_name: str) -> dict:
@@ -14060,6 +14314,7 @@ SELECT json_build_object(
         progress_callback=None,
         post_commit_callback=None,
         timing_report: dict | None = None,
+        job_context: dict | None = None,
     ) -> dict:
         if timing_report is None:
             timing_report = self.create_cross_table_expansion_timing_report(
@@ -14090,6 +14345,7 @@ SELECT json_build_object(
         )
         fast_enabled = os.environ.get("PDM_FAST_EXPAND", "1") != "0"
         fast_plan = None
+        batched = None
         if os.environ.get("PDM_BATCH_PREFLIGHT", "1") != "0":
             fast_request = (
                 self._fast_plan_request(prepared, source_schema_name, source_table_name)
@@ -14421,15 +14677,41 @@ FROM pg_temp.pgdm_expansion_timings;
                 + timing_result_sql
                 + "\nDROP TABLE pg_temp.pgdm_expansion_timings;\n"
             )
+            signature_value = hashlib.sha256(
+                json.dumps(
+                    {
+                        "database": database_name,
+                        "raw_schemas": prepared["raw_schemas"],
+                        "statements": [
+                            [destination["table_name"], destination["statements"]]
+                            for destination in prepared["destinations"]
+                        ],
+                    },
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            job = self._choose_expansion_job(
+                database_name,
+                signature_value,
+                fast_plan["job_id"] if fast_plan else uuid.uuid4().hex[:16],
+                (batched or {}).get("jobs") if os.environ.get("PDM_BATCH_PREFLIGHT", "1") != "0" else None,
+            )
+            job_id = job["job_id"]
+            job_dir = f"{REMOTE_STORAGE_DIR}/expand_jobs/{job_id}"
+            token_sql = self._expansion_token_sql(
+                source_schema_name,
+                source_table_name,
+                [(d["schema_name"], d["pure_table_name"]) for d in prepared["destinations"]],
+            )
             if fast_plan is not None and fast_plan["plan"].parallel:
-                wrapped_sql = fast_expansion.render(
+                files = fast_expansion.render(
                     fast_plan["plan"],
                     fast_plan["catalog"],
                     source_schema_name,
                     source_table_name,
                     fast_plan["source_sql"],
-                    fast_plan["job_id"],
-                    fast_plan["job_dir"],
+                    job_id,
+                    job_dir,
                     manifest_sql,
                     destination_lock_sql,
                     timing_table_sql,
@@ -14448,26 +14730,42 @@ FROM pg_temp.pgdm_expansion_timings;
                             timing_statement_index=index,
                         )
                     ),
-                    {
-                        "PGHOST": "localhost",
-                        "PGUSER": self.sql_username,
-                        "PGDATABASE": database_name,
-                    },
+                    signature_value,
+                    token_sql,
                 )
-        if fast_plan is not None and fast_plan["plan"].parallel:
-            # The runner is staged to a private temporary file first: it starts psql sessions and
-            # shell commands of its own, which must not consume the script from the SSH stdin.
-            command = (
-                'pgdm_runner="$(mktemp)"; cat > "$pgdm_runner"; '
-                'bash "$pgdm_runner" </dev/null; pgdm_status=$?; '
-                'rm -f "$pgdm_runner"; exit $pgdm_status'
+            else:
+                # the original single-transaction batch, run by the same detached, recoverable job runner
+                commit_index = wrapped_sql.index(
+                    "INSERT INTO pg_temp.pgdm_expansion_timings VALUES (9000,"
+                )
+                begin_index = wrapped_sql.index("BEGIN ISOLATION LEVEL REPEATABLE READ;")
+                files = {
+                    "setup.sql": fast_expansion.job_setup_sql(job_id, signature_value, [], token_sql),
+                    "coordinator.sql": (
+                        wrapped_sql[:begin_index]
+                        + "\n".join(fast_expansion.job_setup_step(job_dir, job_id, None))
+                        + "\n"
+                        + wrapped_sql[begin_index:commit_index]
+                        + fast_expansion.commit_marker_sql(job_id, manifest_sql)
+                        + "\n"
+                        + f"UPDATE {sql_ident(fast_expansion.JOB_SCHEMA)}.jobs SET state = 'committed', "
+                        + f"updated_at = clock_timestamp() WHERE job_id = {sql_literal(job_id)};\n"
+                        + wrapped_sql[commit_index:]
+                    ),
+                }
+            runner = fast_expansion.runner_script(
+                job_dir,
+                files,
+                {"PGHOST": "localhost", "PGUSER": self.sql_username, "PGDATABASE": database_name},
             )
-        else:
-            command = (
-                f"psql -h localhost -U {shlex.quote(self.sql_username)} "
-                f"-d {shlex.quote(database_name)} "
-                "-X -qAt -v ON_ERROR_STOP=1 -f -"
-            )
+            registry_payload = {
+                "source_versions": source_versions,
+                "source_schema_name": source_schema_name,
+                "source_table_name": source_table_name,
+                "raw_schemas": list(prepared["raw_schemas"]),
+                "destinations": prepared["destinations"],
+                "job_dir": job_dir,
+            }
         self._notify_progress(
             progress_callback,
             "execute",
@@ -14477,21 +14775,26 @@ FROM pg_temp.pgdm_expansion_timings;
         with self.expansion_timing_scope(
             timing_report,
             "execute",
+            "Register expansion job and start the server-side runner",
+        ):
+            self._start_expansion_job(
+                database_name,
+                source_full_table_name,
+                job,
+                signature_value,
+                registry_payload,
+                job_context or {},
+                runner,
+                cancel_event=cancel_event,
+            )
+        with self.expansion_timing_scope(
+            timing_report,
+            "execute",
             "Expansion database batch envelope",
             record_local_cpu=False,
             remote_include_in_total=False,
         ):
-            output = self.run_remote_command(
-                command,
-                stdin_text=wrapped_sql,
-                cancel_event=cancel_event,
-                stdin_progress_callback=lambda progress, message: self._notify_progress(
-                    progress_callback,
-                    "execute",
-                    10 + (progress * 0.8),
-                    message,
-                ),
-            )
+            output = self._wait_expansion_job(job_dir, cancel_event=cancel_event)
         if post_commit_callback:
             post_commit_callback()
 
@@ -14576,6 +14879,7 @@ FROM pg_temp.pgdm_expansion_timings;
             "dependency_manifest": manifest,
             "destinations": prepared["destinations"],
             "timing_report": timing_report,
+            "job_id": job_id,
         }
 
     def execute_sql_script(
@@ -15614,6 +15918,36 @@ FROM inserted_version;
             )
             normalized_destinations.append(full_table_name)
             version_statement_sequence += 1
+
+        expansion_job_id = str((expansion_result or {}).get("job_id") or "").strip()
+        if expansion_job_id:
+            # exactly-once: the job is marked registered in the same control transaction as its versions
+            sql_parts.insert(
+                2,
+                f"""
+DO $pgdm_job_registered$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM {CONTROL_SCHEMA_IDENT}.expansion_jobs
+        WHERE job_id = {sql_literal(expansion_job_id)} AND state = 'registered'
+    ) THEN
+        RAISE EXCEPTION 'Expansion job % has already been registered.', {sql_literal(expansion_job_id)};
+    END IF;
+END
+$pgdm_job_registered$;
+""".strip(),
+            )
+            sql_parts.append(
+                f"""
+UPDATE {CONTROL_SCHEMA_IDENT}.expansion_jobs
+SET state = 'registered',
+    requested_by = {sql_literal(requested_by)},
+    workstation_name = {sql_literal(workstation_name)},
+    registered_at = now(),
+    updated_at = now()
+WHERE job_id = {sql_literal(expansion_job_id)};
+""".strip()
+            )
 
         sql_parts.extend(
             [

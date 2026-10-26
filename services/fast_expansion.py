@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shlex
 
@@ -253,6 +254,116 @@ def rewrite_relations(sql: str, managed: dict[tuple[str, str], str]) -> str:
     return sql
 
 
+# --------------------------------------------------------------------------- job bookkeeping
+JOB_DDL = f"""
+CREATE SCHEMA IF NOT EXISTS {qi(JOB_SCHEMA)};
+CREATE TABLE IF NOT EXISTS {qi(JOB_SCHEMA)}.jobs (
+    job_id text PRIMARY KEY,
+    signature text NOT NULL,
+    state text NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    attempts integer NOT NULL DEFAULT 0,
+    payload jsonb NOT NULL DEFAULT '{{}}'::jsonb
+);
+CREATE TABLE IF NOT EXISTS {qi(JOB_SCHEMA)}.units (
+    job_id text NOT NULL,
+    unit_id text NOT NULL,
+    segment text NOT NULL,
+    state text NOT NULL DEFAULT 'pending',
+    rows bigint,
+    finished_at timestamptz,
+    PRIMARY KEY (job_id, unit_id)
+);
+""".strip()
+
+
+def job_setup_sql(job_id: str, signature_value: str, sequences: list[str], token_sql: str = "NULL") -> str:
+    """Register (or re-open) the job; the identity sequences' state is recorded on the first attempt only,
+    so every attempt can restore it and assign exactly the same identity values."""
+    seq_json = (" || ".join(
+        f"jsonb_build_object({ql(seq)}, (SELECT jsonb_build_array(last_value, is_called) FROM {seq}))"
+        for seq in sequences) or "'{}'::jsonb")
+    return (
+        "\\set ON_ERROR_STOP 1\nSET client_min_messages = warning;\nBEGIN;\n" + JOB_DDL + "\n"
+        f"INSERT INTO {qi(JOB_SCHEMA)}.jobs (job_id, signature, state, attempts, payload)\n"
+        f"VALUES ({ql(job_id)}, {ql(signature_value)}, 'running', 1, "
+        f"jsonb_build_object('sequences', {seq_json}, 'token', {token_sql}))\n"
+        "ON CONFLICT (job_id) DO UPDATE SET state = 'running', attempts = jobs.attempts + 1, "
+        "updated_at = clock_timestamp();\n"
+        # staging tables are UNLOGGED: crash recovery empties them (and pg_postmaster_start_time() does not
+        # move on a crash restart), so a finished checkpoint whose table is now missing or empty although it
+        # recorded rows is recomputed - deterministically, so its identity offsets stay valid
+        f"UPDATE {qi(JOB_SCHEMA)}.units u SET state = 'pending' WHERE u.job_id = {ql(job_id)} AND u.state = 'done' "
+        f"AND u.rows > 0 AND COALESCE(pg_relation_size(to_regclass(format('%I.%I', "
+        f"{ql(STAGE_SCHEMA_PREFIX + job_id)}, u.unit_id))), 0) = 0;\n"
+        "COMMIT;\n")
+
+
+def job_setup_step(job_dir: str, job_id: str, first_views: str | None) -> list[str]:
+    """Coordinator lines (before its transaction) that register the job and, for parallel plans, create
+    the checkpoint units, staging schema and first views. They commit on their own (workers must see
+    them) and are timed so the setup is part of the measured total."""
+    body = [f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/setup.sql')}"]
+    if first_views:
+        body += [f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/stage_setup.sql')}",
+                 f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/' + first_views)}",
+                 f"SELECT 1 / (SELECT count(*)::int FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)}) "
+                 "AS setup_check \\g /dev/null"]
+    body.append(f"SELECT 1 / (SELECT count(*)::int FROM {qi(JOB_SCHEMA)}.jobs WHERE job_id = {ql(job_id)} "
+                "AND state = 'running') AS job_check \\g /dev/null")
+    t = _Timings()
+    t.around(0, "Register job and prepare checkpoints", "\n".join(body), stage="prepare")
+    return t.lines
+
+
+def restore_sequences_sql(job_id: str, sequences: list[str]) -> str:
+    return "\n".join(
+        f"SELECT setval({ql(seq)}, (s.v->>0)::bigint, (s.v->>1)::boolean) FROM "
+        f"(SELECT payload->'sequences'->{ql(seq)} AS v FROM {qi(JOB_SCHEMA)}.jobs WHERE job_id = {ql(job_id)}) s "
+        "WHERE s.v IS NOT NULL \\g /dev/null" for seq in sequences)
+
+
+def commit_marker_sql(job_id: str, manifest_sql: str) -> str:
+    """Inside the expansion transaction: refuse to finish a resumed job whose source changed, store the
+    manifest (what the version registration needs) and mark the job committed atomically with the data."""
+    select = manifest_sql[manifest_sql.rindex("SELECT json_build_object("):].rstrip().rstrip(";").rstrip()
+    if select.endswith("::text"):
+        select = select[:-len("::text")]
+    return (
+        f"DO $pgdm_job_manifest$ BEGIN\n"
+        f"  IF EXISTS (SELECT 1 FROM {qi(JOB_SCHEMA)}.jobs WHERE job_id = {ql(job_id)} AND payload ? 'manifest'\n"
+        f"             AND payload->'manifest' <> ({select})::jsonb) THEN\n"
+        f"    RAISE EXCEPTION 'The source changed since this expansion was checkpointed; it must be restarted.';\n"
+        f"  END IF;\nEND $pgdm_job_manifest$;\n"
+        f"UPDATE {qi(JOB_SCHEMA)}.jobs SET payload = payload || jsonb_build_object('manifest', ({select})::jsonb), "
+        f"updated_at = clock_timestamp() WHERE job_id = {ql(job_id)};")
+
+
+def runner_script(job_dir: str, files: dict, env: dict) -> str:
+    """Materialise the job directory and run the coordinator detached from the SSH session: stdout and
+    stderr go to files, the exit status to `status`. The client waits for the process and then reads them;
+    if the SSH connection drops the job carries on and can be collected later."""
+    lines = ["set -u", f"d={shlex.quote(job_dir)}", 'mkdir -p "$d"', 'chmod 700 "$d"', 'rm -f "$d/status"']
+    for k, v in env.items():
+        lines.append(f"export {k}={shlex.quote(str(v))}")
+    for name, content in files.items():
+        tag = "PGDM_FAST_EOF"
+        while tag in content:
+            tag += "_X"
+        lines.append(f"cat > \"$d/{name}\" <<'{tag}'\n{content}{'' if content.endswith(chr(10)) else chr(10)}{tag}")
+    lines.append('cat > "$d/run.sh" <<\'PGDM_RUN_EOF\'\n'
+                 'd="$(cd "$(dirname "$0")" && pwd)"\n'
+                 'psql -X -qAt -v ON_ERROR_STOP=1 -f "$d/coordinator.sql" >"$d/coordinator.out" 2>"$d/coordinator.err"\n'
+                 'status=$?\n'
+                 'if [ $status -ne 0 ] && [ -s "$d/workers.log" ]; then grep -m 20 -E "ERROR|FAILED" "$d/workers.log" >>"$d/coordinator.err"; fi\n'
+                 'echo $status > "$d/status.tmp" && mv "$d/status.tmp" "$d/status"\n'
+                 'PGDM_RUN_EOF')
+    lines.append('setsid nohup bash "$d/run.sh" </dev/null >/dev/null 2>&1 & echo $! > "$d/pid"')
+    lines.append('echo "PGDM_JOB_STARTED $(cat "$d/pid")"')
+    return "\n".join(lines) + "\n"
+
+
 # --------------------------------------------------------------------------- catalog inspection
 def catalog_sql(source_schema: str, source_table: str, destinations: list[tuple[str, str]], function_names: list[str]) -> str:
     dest_values = ", ".join(f"({ql(s)}, {ql(t)})" for s, t in destinations) or "(NULL, NULL)"
@@ -461,7 +572,7 @@ class _Timings:
 
 def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, source_sql: str, job_id: str,
            job_dir: str, manifest_sql: str, lock_sql: str, timing_table_sql: str, timing_result_sql: str,
-           row_counts_table: str, managed_dml, connection_env: dict) -> str:
+           row_counts_table: str, managed_dml, signature_value: str, token_sql: str = "NULL") -> dict:
     """-> bash runner. It writes the SQL files into job_dir, registers the job and its units (checkpoints),
     and runs the coordinator, whose stdout carries the manifest and timing JSON lines exactly like the
     original batch. Worker phases are launched by the coordinator with psql's \\! while it holds the lock."""
@@ -498,6 +609,8 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
         return "\nUNION ALL\n".join(parts)
 
     exported = [k for k in dest_meta if any(s.get("export") and s["key"] == k for s in plan.segments)]
+    prefix_sequences = sorted({c["sequence"] for s in plan.segments if s.get("serial_kind") == "prefix"
+                               for c in dest_meta[s["key"]]["columns"] if c["sequence"]})
 
     def serial_copy(key):
         return f"{qi(xs)}.{qi(key[1] + '__serial')}"
@@ -571,22 +684,15 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
     t = _Timings()
     co = [timing_table_sql,
           "SET idle_in_transaction_session_timeout = 0;", "SET statement_timeout = 0;", "SET lock_timeout = 0;"]
-    if par:
-        # checkpoint tables, staging schema and the first segment's views commit on their own (workers
-        # must see them); timed here so the setup is part of the measured total
-        setup = _Timings()
-        setup.around(0, "Prepare checkpoint tables and staging schema",
-                     f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/setup.sql')}\n"
-                     f"\\! psql -X -q -v ON_ERROR_STOP=1 -f {shlex.quote(job_dir + '/' + par[0]['name'] + '_views.sql')}\n"
-                     f"SELECT 1 / (SELECT count(*)::int FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} LIMIT 1) "
-                     "AS setup_check \\g /dev/null", stage="prepare")
-        co += setup.lines
+    co += job_setup_step(job_dir, job_id, par[0]["name"] + "_views.sql" if par else None)
     co.append("BEGIN;")
     t.around(1, "Initialize database transaction",
              "SET LOCAL client_min_messages = warning;\nSET LOCAL synchronize_seqscans = off;")
     t.around(2, "Acquire destination table locks",
              lock_sql + f"\nLOCK TABLE {qi(source_schema)}.{qi(source_table)} IN SHARE MODE;")
     t.around(3, "Scan source and build dependency manifest", manifest_sql)
+    if prefix_sequences:
+        t.lines.append(restore_sequences_sql(job_id, prefix_sequences))
     # statements that must run exactly as in the original (before the first parallel one)
     for i, seg in enumerate(plan.segments):
         if seg.get("serial_kind") == "prefix":
@@ -635,8 +741,9 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
                  f"SET LOCAL max_parallel_maintenance_workers = {max(0, min(8, plan.workers - 1))};\n" + restore_sql)
     if par:
         t.around(201, "Advance identity sequences", _sequence_sql(xs, par, dest_meta, seq_col))
-        t.lines.append(f"UPDATE {qi(JOB_SCHEMA)}.jobs SET state = 'committed', updated_at = clock_timestamp() "
-                       f"WHERE job_id = {ql(job_id)};")
+    t.lines.append(commit_marker_sql(job_id, manifest_sql))
+    t.lines.append(f"UPDATE {qi(JOB_SCHEMA)}.jobs SET state = 'committed', updated_at = clock_timestamp() "
+                   f"WHERE job_id = {ql(job_id)};")
     co += t.lines
     co += ["INSERT INTO pg_temp.pgdm_expansion_timings VALUES (9000, 'execute', 'Commit expansion transaction', "
            "clock_timestamp(), NULL, NULL, NULL, NULL);", "COMMIT;",
@@ -649,10 +756,12 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
                "UPDATE pg_temp.pgdm_expansion_timings SET finished_at = clock_timestamp() WHERE sequence_number = 9001;"]
     co += [timing_result_sql, "DROP TABLE pg_temp.pgdm_expansion_timings;"]
     files["coordinator.sql"] = "\n".join(co) + "\n"
-    files["setup.sql"] = _setup_sql(xs, job_id, par, len(ranges),
-                                   [(serial_copy(k), f"{qi(k[0])}.{qi(k[1])}") for k in exported])
+    all_sequences = sorted({c["sequence"] for m in dest_meta.values() for c in m["columns"] if c["sequence"]})
+    files["setup.sql"] = job_setup_sql(job_id, signature_value, all_sequences, token_sql)
+    files["stage_setup.sql"] = _setup_sql(xs, job_id, par, len(ranges),
+                                          [(serial_copy(k), f"{qi(k[0])}.{qi(k[1])}") for k in exported])
     files["phase.sh"] = _phase_script(plan.workers)
-    return _runner(job_dir, files, par, connection_env)
+    return files
 
 
 def _unit_file(files, xs, job_id, table, sql, search_path) -> str:
@@ -725,6 +834,10 @@ def _verify_sql(xs, job_id, par, unit_tables) -> str:
                       f"{qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND unit_id IN "
                       f"({', '.join(ql(t) for t in unit_tables(seg))})), -2) FROM {qi(xs)}.unit_offsets o "
                       f"WHERE o.segment = {ql(seg['name'])})")
+    tables = [t for seg in par for t in unit_tables(seg)]
+    checks.append(f"NOT EXISTS (SELECT 1 FROM {qi(JOB_SCHEMA)}.units u WHERE u.job_id = {ql(job_id)} AND u.rows > 0 "
+                  f"AND u.unit_id IN ({', '.join(ql(t) for t in tables)}) AND COALESCE(pg_relation_size("
+                  f"to_regclass(format('%I.%I', {ql(xs)}, u.unit_id))), 0) = 0)")
     return (f"DO $pgdm_fast_verify$ BEGIN\n"
             f"  IF EXISTS (SELECT 1 FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND state <> 'done') THEN\n"
             f"    RAISE EXCEPTION 'Parallel expansion units did not complete: %', (SELECT string_agg(unit_id, ', ') "
@@ -798,8 +911,6 @@ def _bulk_ddl(keys, dest_meta) -> tuple[str, str]:
         cons = {c["name"]: c for c in meta["constraints"]}
         for idx in meta["indexes"]:
             con = cons.get(idx["constraint"]) if idx["constraint"] else None
-            if con and con["type"] == "p":
-                continue  # primary keys stay (sequential identity values: cheap right-edge appends)
             if con:
                 drop.append(f"ALTER TABLE {table} DROP CONSTRAINT {qi(con['name'])};")
                 restore_idx.append(f"ALTER TABLE {table} ADD CONSTRAINT {qi(con['name'])} {con['def']};")
@@ -810,6 +921,8 @@ def _bulk_ddl(keys, dest_meta) -> tuple[str, str]:
                 restore_idx.append(idx["def"] + ";")
                 if idx.get("comment"):
                     restore_idx.append(f"COMMENT ON INDEX {qi(key[0])}.{qi(idx['name'])} IS {ql(idx['comment'])};")
+    # primary keys first: FK validation needs the referenced unique indexes
+    restore_idx.sort(key=lambda sql: 0 if " PRIMARY KEY " in sql else 1)
     return "\n".join(drop), "\n".join(restore_idx + restore_fk)
 
 
@@ -836,20 +949,11 @@ def _setup_sql(xs, job_id, par, nranges, copies=()) -> str:
             units.append(f"({ql(job_id)}, {ql(s['name'] + '_r0')}, {ql(s['name'])})")
     return (
         "\\set ON_ERROR_STOP 1\nSET client_min_messages = warning;\nBEGIN;\n"
-        f"CREATE SCHEMA IF NOT EXISTS {qi(JOB_SCHEMA)};\n"
-        f"CREATE TABLE IF NOT EXISTS {qi(JOB_SCHEMA)}.jobs (job_id text PRIMARY KEY, state text NOT NULL, "
-        "created_at timestamptz NOT NULL DEFAULT clock_timestamp(), "
-        "updated_at timestamptz NOT NULL DEFAULT clock_timestamp(), payload jsonb);\n"
-        f"CREATE TABLE IF NOT EXISTS {qi(JOB_SCHEMA)}.units (job_id text NOT NULL, unit_id text NOT NULL, "
-        "segment text NOT NULL, state text NOT NULL DEFAULT 'pending', rows bigint, finished_at timestamptz, "
-        "PRIMARY KEY (job_id, unit_id));\n"
         f"CREATE SCHEMA IF NOT EXISTS {qi(xs)};\n"
         f"CREATE TABLE IF NOT EXISTS {qi(xs)}.unit_offsets (segment text NOT NULL, unit int NOT NULL, "
         "unit_rows bigint NOT NULL, unit_offset bigint NOT NULL, first_value bigint NOT NULL, "
         "increment_by bigint NOT NULL, PRIMARY KEY (segment, unit));\n"
         + "".join(f"CREATE UNLOGGED TABLE IF NOT EXISTS {c} (LIKE {src});\n" for c, src in copies)
-        + f"INSERT INTO {qi(JOB_SCHEMA)}.jobs (job_id, state) VALUES ({ql(job_id)}, 'running') "
-        "ON CONFLICT (job_id) DO UPDATE SET state = 'running', updated_at = clock_timestamp();\n"
         + (f"INSERT INTO {qi(JOB_SCHEMA)}.units (job_id, unit_id, segment) VALUES {', '.join(units)} "
            "ON CONFLICT DO NOTHING;\n" if units else "")
         + "COMMIT;\n")
@@ -871,21 +975,3 @@ nv="$(tr -d '\\n' < "$d/phase_$seg.next")"
 if [ -n "$nv" ]; then run "$nv"; fi
 exit 0
 """
-
-
-def _runner(job_dir, files, par, env) -> str:
-    """Bash runner: materialise the job directory, register the checkpoints, prepare the first views,
-    run the coordinator (stdout = manifest + timings), keep the job directory only on failure."""
-    lines = ["set -u", f"d={shlex.quote(job_dir)}", 'mkdir -p "$d"', 'chmod 700 "$d"']
-    for k, v in env.items():
-        lines.append(f"export {k}={shlex.quote(str(v))}")
-    for name, content in files.items():
-        tag = "PGDM_FAST_EOF"
-        while tag in content:
-            tag += "_X"
-        lines.append(f"cat > \"$d/{name}\" <<'{tag}'\n{content}{'' if content.endswith(chr(10)) else chr(10)}{tag}")
-    lines.append('psql -X -qAt -v ON_ERROR_STOP=1 -f "$d/coordinator.sql"; status=$?')
-    lines.append('if [ $status -ne 0 ] && [ -s "$d/workers.log" ]; then grep -m 20 -E "ERROR|FAILED" "$d/workers.log" >&2; fi')
-    lines.append('if [ $status -eq 0 ]; then rm -rf "$d"; fi')
-    lines.append("exit $status")
-    return "\n".join(lines) + "\n"

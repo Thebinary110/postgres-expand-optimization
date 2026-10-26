@@ -61,6 +61,9 @@ def main():
     ap.add_argument("--title", default="headless benchmark")
     ap.add_argument("--report", default=None, help="write the report text here")
     ap.add_argument("--json", default=None, help="write the raw timing report dict here")
+    ap.add_argument("--skip-register", action="store_true",
+                    help="stop right after the data commit (simulates a client lost before version registration)")
+    ap.add_argument("--recover-only", action="store_true", help="only finish pending registrations, then exit")
     args = ap.parse_args()
 
     _stub_gui_modules()
@@ -75,6 +78,11 @@ def main():
     service.ensure_control_database()
     service.ensure_remote_admin_dirs()
     service.ensure_admin_schema()
+    for item in service.recover_pending_expansions():
+        print(f"recovered pending expansion {item['job_id']} in {item['database_name']}", flush=True)
+    if args.recover_only:
+        service.close()
+        return
 
     raw_schemas = service.resolve_raw_schema_interval(
         service.list_table_raw_schemas(args.database, args.source), args.raw_schema, args.raw_schema)
@@ -88,8 +96,13 @@ def main():
     result = service.execute_cross_table_expansion(
         database_name=args.database, source_full_table_name=args.source, raw_schemas=raw_schemas,
         destinations=destinations, cancel_event=None,
+        job_context={"requested_by": args.author, "workstation_name": socket.gethostname()},
         progress_callback=lambda stage, pct, msg: print(f"[{stage} {pct:>3}%] {msg}", flush=True),
         post_commit_callback=lambda *a, **k: None, timing_report=report)
+    if args.skip_register:
+        print(f"data committed by job {result.get('job_id')}; registration skipped", flush=True)
+        service.close()
+        return
     versions = service.register_cross_table_expansion_versions(
         expansion_result=result, requested_by=args.author, workstation_name=socket.gethostname(),
         cancel_event=None, progress_callback=lambda stage, pct, msg: print(f"[{stage} {pct:>3}%] {msg}", flush=True),

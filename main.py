@@ -15,6 +15,7 @@ Mapa dos módulos:
 import os
 import json
 import socket
+import sys
 import threading
 import time
 import traceback
@@ -3471,6 +3472,11 @@ class App(ctk.CTk):
             control_database_created = self.service.ensure_control_database()
             self.service.ensure_remote_admin_dirs()
             self.service.ensure_admin_schema()
+            try:
+                # expansions whose data committed but whose versions were not registered (lost connection)
+                self.service.recover_pending_expansions()
+            except Exception as exc:
+                print(f"Pending expansion recovery failed: {exc}", file=sys.stderr)
             self.can_create_db = self.service.check_can_create_database()
 
             dbs = self.service.list_databases()
@@ -5441,6 +5447,10 @@ class App(ctk.CTk):
                 source_full_table_name=source_table_name,
                 raw_schemas=expansion_request["raw_schemas"],
                 destinations=expansion_request["destinations"],
+                job_context={
+                    "requested_by": expansion_request["requested_by"],
+                    "workstation_name": socket.gethostname(),
+                },
                 cancel_event=cancel_event,
                 progress_callback=lambda stage_key, progress, message: self.ui(
                     self.update_cross_table_expansion_progress,
