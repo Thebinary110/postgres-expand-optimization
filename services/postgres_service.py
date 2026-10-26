@@ -3,12 +3,14 @@ import csv
 import hashlib
 import io
 import json
+import os
 import re
 import shlex
 import sys
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 from contextlib import contextmanager
 from datetime import datetime
@@ -16,6 +18,8 @@ from pathlib import Path
 
 import paramiko
 import pandas as pd
+
+from services import fast_expansion
 
 from config import (
     CONTROL_DB,
@@ -9040,10 +9044,9 @@ mkdir -p {shlex.quote(self.remote_storage_root)}/deletions/table
 
         return True
 
-    def ensure_admin_schema(self, cancel_event=None, trace_context: dict | None = None):
-        started_at = time.perf_counter()
-        self._trace_table_open(trace_context, "ensure_admin_schema(): iniciando")
-        sql = f"""
+    @staticmethod
+    def _admin_schema_sql() -> str:
+        return f"""
 CREATE SCHEMA IF NOT EXISTS {CONTROL_SCHEMA_IDENT};
 
 CREATE TABLE IF NOT EXISTS {CONTROL_TABLE_DELETE_AUDIT} (
@@ -9276,6 +9279,11 @@ SET version_history_format = CASE
 END
 WHERE version_history_format IS NULL;
 """
+
+    def ensure_admin_schema(self, cancel_event=None, trace_context: dict | None = None):
+        started_at = time.perf_counter()
+        self._trace_table_open(trace_context, "ensure_admin_schema(): iniciando")
+        sql = self._admin_schema_sql()
         command = (
             f"psql -h localhost -U {shlex.quote(self.sql_username)} "
             f"-d {shlex.quote(CONTROL_DB)} -X -c {shlex.quote(sql)}"
@@ -12582,13 +12590,29 @@ END
         commands: set[str],
         delete_relationship_acknowledged: bool = False,
         cancel_event=None,
+        metadata=None,
     ):
         dml_commands = commands & {"insert", "update", "delete", "truncate"}
         if not dml_commands:
             return
-
         schema_name, table_name = split_table_name(full_table_name)
-        sql = f"""
+        if metadata is None:
+            sql = self._managed_dependencies_sql(schema_name, table_name) + ";"
+            command = (
+                f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+                f"-d {shlex.quote(database_name)} -X -At -v ON_ERROR_STOP=1 -c {shlex.quote(sql)}"
+            )
+            output = self.run_remote_command(command, cancel_event=cancel_event).strip()
+            if not output:
+                raise RuntimeError(f"A tabela selecionada {schema_name}.{table_name} nao existe.")
+            metadata = json.loads(output.splitlines()[-1])
+        self._check_managed_dependencies_metadata(
+            metadata, dml_commands, delete_relationship_acknowledged
+        )
+
+    @staticmethod
+    def _managed_dependencies_sql(schema_name: str, table_name: str) -> str:
+        return f"""
 SELECT json_build_object(
     'relation_kind', target.relkind,
     'is_partition', target.relispartition,
@@ -12658,17 +12682,11 @@ SELECT json_build_object(
 FROM pg_class AS target
 JOIN pg_namespace AS target_namespace ON target_namespace.oid = target.relnamespace
 WHERE target_namespace.nspname = {sql_literal(schema_name)}
-  AND target.relname = {sql_literal(table_name)};
-"""
-        command = (
-            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
-            f"-d {shlex.quote(database_name)} -X -At -v ON_ERROR_STOP=1 -c {shlex.quote(sql)}"
-        )
-        output = self.run_remote_command(command, cancel_event=cancel_event).strip()
-        if not output:
-            raise RuntimeError(f"A tabela selecionada {schema_name}.{table_name} nao existe.")
+  AND target.relname = {sql_literal(table_name)}
+""".strip()
 
-        metadata = json.loads(output.splitlines()[-1])
+    @staticmethod
+    def _check_managed_dependencies_metadata(metadata, dml_commands, delete_relationship_acknowledged):
         if metadata.get("relation_kind") != "r" or metadata.get("is_partition"):
             raise RuntimeError(
                 "O contador automatico do botao SQL aceita alteracao de linhas apenas em tabelas comuns, "
@@ -13578,7 +13596,31 @@ WHERE database_name = {sql_literal(database_name)}
         database_name: str,
         destinations,
         cancel_event=None,
+        function_metadata=None,
     ):
+        if function_metadata is None:
+            sql = self._expansion_function_metadata_sql(destinations)
+            if sql is None:
+                return
+            command = (
+                f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+                f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 "
+                f"-c {shlex.quote(sql)}"
+            )
+            output = self.run_remote_command(
+                command,
+                cancel_event=cancel_event,
+            ).strip()
+            try:
+                function_metadata = json.loads(output.splitlines()[-1] if output else "[]")
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "Could not validate the functions used by the expansion."
+                ) from exc
+        self._check_expansion_function_metadata(function_metadata)
+
+    @staticmethod
+    def _expansion_function_metadata_sql(destinations) -> str | None:
         function_references = []
         for destination in destinations or []:
             for reference in destination.get("function_references") or []:
@@ -13592,7 +13634,7 @@ WHERE database_name = {sql_literal(database_name)}
                 ):
                     function_references.append(normalized_reference)
         if not function_references:
-            return
+            return None
 
         values_sql = ",\n".join(
             (
@@ -13645,22 +13687,10 @@ SELECT COALESCE(
 )::text
 FROM requested;
 """
-        command = (
-            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
-            f"-d {shlex.quote(database_name)} -X -qAt -v ON_ERROR_STOP=1 "
-            f"-c {shlex.quote(sql)}"
-        )
-        output = self.run_remote_command(
-            command,
-            cancel_event=cancel_event,
-        ).strip()
-        try:
-            function_metadata = json.loads(output.splitlines()[-1] if output else "[]")
-        except json.JSONDecodeError as exc:
-            raise RuntimeError(
-                "Could not validate the functions used by the expansion."
-            ) from exc
+        return sql
 
+    @staticmethod
+    def _check_expansion_function_metadata(function_metadata):
         problems = []
         for item in function_metadata or []:
             requested_schema = str(item.get("requested_schema") or "").strip()
@@ -13785,6 +13815,241 @@ SELECT json_build_object(
 )::text;
 """.strip()
 
+    def _batched_expansion_preflight(
+        self,
+        database_name: str,
+        prepared: dict,
+        source_full_table_name: str,
+        cancel_event=None,
+        plan_script: str = "",
+    ) -> dict:
+        """Every read-only preflight query of the original expansion, run in one SSH command with one
+        psql session per database instead of ~35 round trips (each paying an SSH channel, a shell, a
+        psql start-up and a SCRAM login). The control database is prepared with the same
+        ensure_admin_schema DDL, the data database with the same row-counter DDL, missing counters are
+        reconciled exactly like get_table_row_count() does, and the caller applies the original checks to
+        the returned metadata in the original order with the original messages."""
+        source_schema_name, source_table_name = split_table_name(source_full_table_name)
+        scope_sql = ", ".join(sql_literal(value) for value in prepared["raw_schemas"])
+        destinations = [
+            (destination["schema_name"], destination["pure_table_name"], destination["table_name"])
+            for destination in prepared["destinations"]
+        ]
+        function_sql = self._expansion_function_metadata_sql(prepared["destinations"])
+        control_sql = (
+            "\\set ON_ERROR_STOP 1\n"
+            + self._admin_schema_sql()
+            + "\n\\echo PGDM_SECTION versions\n"
+            + f"""
+SELECT COALESCE(json_agg(json_build_object(
+    'version_code', version_code, 'raw_schema', raw_schema,
+    'raw_dump_path', COALESCE(raw_dump_path, ''), 'raw_hash', COALESCE(raw_hash, ''))
+    ORDER BY version_code::integer), '[]'::json)::text
+FROM {CONTROL_TABLE_VERSIONS}
+WHERE database_name = {sql_literal(database_name)}
+  AND schema_name = {sql_literal(source_schema_name)}
+  AND table_name = {sql_literal(source_table_name)}
+  AND raw_schema IN ({scope_sql});
+"""
+        )
+        destination_values = ", ".join(
+            f"({sql_literal(schema_name)}, {sql_literal(table_name)})"
+            for schema_name, table_name, _full_name in destinations
+        )
+        dependency_items = ", ".join(
+            f"{sql_literal(f'{schema_name}.{table_name}')}, "
+            f"(SELECT ({self._managed_dependencies_sql(schema_name, table_name)})::json)"
+            for schema_name, table_name, _full_name in destinations
+        )
+        data_sql = (
+            "\\set ON_ERROR_STOP 1\n"
+            "BEGIN;\nSET LOCAL client_min_messages = warning;\n"
+            + self._data_table_row_counts_ddl_sql()
+            + "\nCOMMIT;\n"
+            # counters missing for existing destinations are reconciled exactly like
+            # reconcile_table_row_count(): under SHARE ROW EXCLUSIVE, from an exact COUNT(*)
+            + f"""
+BEGIN;
+SET LOCAL client_min_messages = warning;
+DO $pgdm_batched_reconcile$
+DECLARE
+    item record;
+BEGIN
+    FOR item IN
+        SELECT d.schema_name, d.table_name
+        FROM (VALUES {destination_values}) AS d(schema_name, table_name)
+        WHERE EXISTS (SELECT 1 FROM pg_tables t WHERE t.schemaname = d.schema_name AND t.tablename = d.table_name)
+          AND NOT EXISTS (SELECT 1 FROM {DATA_TABLE_ROW_COUNTS} c
+                          WHERE c.schema_name = d.schema_name AND c.table_name = d.table_name)
+    LOOP
+        EXECUTE format('LOCK TABLE %I.%I IN SHARE ROW EXCLUSIVE MODE', item.schema_name, item.table_name);
+        EXECUTE format(
+            'INSERT INTO {DATA_TABLE_ROW_COUNTS} (schema_name, table_name, row_count, initialized_at, '
+            'updated_at, last_reconciled_at) SELECT %L, %L, COUNT(*), clock_timestamp(), clock_timestamp(), '
+            'clock_timestamp() FROM %I.%I ON CONFLICT (schema_name, table_name) DO UPDATE SET '
+            'row_count = EXCLUDED.row_count, updated_at = EXCLUDED.updated_at, '
+            'last_reconciled_at = EXCLUDED.last_reconciled_at',
+            item.schema_name, item.table_name, item.schema_name, item.table_name);
+    END LOOP;
+END
+$pgdm_batched_reconcile$;
+COMMIT;
+\\echo PGDM_SECTION checks
+SELECT json_build_object(
+    'source_exists', EXISTS (SELECT 1 FROM pg_tables
+                             WHERE schemaname = {sql_literal(source_schema_name)}
+                               AND tablename = {sql_literal(source_table_name)}),
+    'source_columns', (SELECT COALESCE(json_agg(a.attname ORDER BY a.attnum), '[]'::json)
+                       FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+                       JOIN pg_namespace n ON n.oid = c.relnamespace
+                       WHERE n.nspname = {sql_literal(source_schema_name)}
+                         AND c.relname = {sql_literal(source_table_name)}
+                         AND a.attnum > 0 AND NOT a.attisdropped),
+    'functions', {f"({function_sql.strip().rstrip(';')})::json" if function_sql else "NULL"},
+    'destinations', (SELECT json_object_agg(d.schema_name || '.' || d.table_name, json_build_object(
+                        'exists', EXISTS (SELECT 1 FROM pg_tables t
+                                          WHERE t.schemaname = d.schema_name AND t.tablename = d.table_name),
+                        'row_count', (SELECT c.row_count FROM {DATA_TABLE_ROW_COUNTS} c
+                                      WHERE c.schema_name = d.schema_name AND c.table_name = d.table_name)))
+                     FROM (VALUES {destination_values}) AS d(schema_name, table_name)),
+    'dependencies', json_build_object({dependency_items})
+)::text;
+"""
+            + plan_script
+        )
+        command = (
+            "nproc 2>/dev/null || echo 1; "
+            f"PGUSER={shlex.quote(self.sql_username)} PGDATABASE={shlex.quote(CONTROL_DB)} "
+            "psql -h localhost -X -qAt -f \"$pgdm_dir/control.sql\" </dev/null && "
+            "echo PGDM_SECTION_DATA && "
+            f"PGUSER={shlex.quote(self.sql_username)} PGDATABASE={shlex.quote(database_name)} "
+            "psql -h localhost -X -qAt -f \"$pgdm_dir/data.sql\" </dev/null"
+        )
+        payload = (
+            'pgdm_dir="$(mktemp -d)"; trap \'rm -rf "$pgdm_dir"\' EXIT\n'
+            f"cat > \"$pgdm_dir/control.sql\" <<'PGDM_CONTROL_EOF'\n{control_sql}\nPGDM_CONTROL_EOF\n"
+            f"cat > \"$pgdm_dir/data.sql\" <<'PGDM_DATA_EOF'\n{data_sql}\nPGDM_DATA_EOF\n"
+            + command + "\n"
+        )
+        output = self.run_remote_command(
+            "bash -s",
+            stdin_text=payload,
+            cancel_event=cancel_event,
+        )
+        sections, current, cpu_count = {}, None, 1
+        for line in output.splitlines():
+            stripped = line.strip()
+            if current is None and stripped.isdigit():
+                cpu_count = int(stripped)
+            elif stripped.startswith("PGDM_SECTION") or stripped.startswith("PGDM_EXPLAIN ") or stripped == "PGDM_CATALOG":
+                current = stripped
+            elif current is not None and stripped:
+                sections[current] = sections.get(current, "") + line + "\n"
+        try:
+            versions = json.loads(sections.get("PGDM_SECTION versions", "[]"))
+            checks = json.loads(sections.get("PGDM_SECTION checks", ""))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Could not read the batched preflight results.") from exc
+        return {
+            "cpu_count": cpu_count,
+            "source_versions": [dict(item) for item in versions if isinstance(item, dict)],
+            "checks": checks,
+            "sections": sections,
+        }
+
+    def _fast_plan_request(self, prepared: dict, source_schema_name: str, source_table_name: str) -> dict:
+        """The catalog query (and EXPLAINs) the parallel planner needs; appended to the batched preflight."""
+        scope_sql = ", ".join(sql_literal(value) for value in prepared["raw_schemas"])
+        source_sql = (
+            "(\n"
+            f"    SELECT *\n"
+            f"    FROM {sql_ident(source_schema_name)}.{sql_ident(source_table_name)}\n"
+            f"    WHERE {sql_ident('raw_schema')} IN ({scope_sql})\n"
+            ")"
+        )
+        function_names = sorted({
+            str(reference[1])
+            for destination in prepared["destinations"]
+            for reference in destination.get("function_references") or []
+        })
+        catalog_sql = fast_expansion.catalog_sql(
+            source_schema_name,
+            source_table_name,
+            [
+                (destination["schema_name"], destination["pure_table_name"])
+                for destination in prepared["destinations"]
+            ],
+            function_names,
+        )
+        # SELECT DISTINCT statements are EXPLAINed too: when the original plan hashes, the identity values
+        # follow hash-table order and the statement must run exactly as before.
+        distinct = fast_expansion.distinct_statements(prepared, source_sql, {})
+        script = "\\echo PGDM_CATALOG\n" + catalog_sql + "\n" + "".join(
+            f"\\echo PGDM_EXPLAIN {index}\nEXPLAIN (FORMAT JSON, COSTS OFF) {statement};\n"
+            for index, statement in distinct
+        )
+        return {"script": script, "distinct": distinct, "source_sql": source_sql}
+
+    def _fast_plan_from_output(self, request: dict, prepared: dict, sections: dict, cpu_count: int) -> dict | None:
+        """Decide how much of the batch can run in parallel (services/fast_expansion.py). Returns None
+        when the original serial batch must be used."""
+        try:
+            catalog = json.loads(sections.get("PGDM_CATALOG", ""))
+        except json.JSONDecodeError:
+            return None
+        hashed_distinct = set()
+        for index, _statement in request["distinct"]:
+            explain = sections.get(f"PGDM_EXPLAIN {index}", "")
+            if not explain or '"Strategy": "Hashed"' in explain or '"Strategy": "Mixed"' in explain:
+                hashed_distinct.add(index)
+        connection_slots = (
+            int(catalog.get("max_connections") or 0)
+            - int(catalog.get("connections_in_use") or 0)
+            - 4
+        )
+        worker_slots = max(1, min(cpu_count, connection_slots))
+        plan = fast_expansion.build_plan(
+            prepared, request["source_sql"], catalog, worker_slots, hashed_distinct
+        )
+        if plan.workers < 2:
+            for segment in plan.segments:
+                segment.update(mode="serial", reason="dataset too small for parallel workers")
+        job_id = uuid.uuid4().hex[:16]
+        return {
+            "plan": plan,
+            "catalog": catalog,
+            "source_sql": request["source_sql"],
+            "job_id": job_id,
+            "job_dir": f"{REMOTE_STORAGE_DIR}/expand_jobs/{job_id}",
+        }
+
+    def _plan_fast_expansion(
+        self,
+        database_name: str,
+        prepared: dict,
+        source_schema_name: str,
+        source_table_name: str,
+        cancel_event=None,
+    ) -> dict | None:
+        """Stand-alone planning round trip (used when the batched preflight is disabled)."""
+        request = self._fast_plan_request(prepared, source_schema_name, source_table_name)
+        command = (
+            "nproc 2>/dev/null || echo 1; "
+            f"PGDATABASE={shlex.quote(database_name)} PGUSER={shlex.quote(self.sql_username)} "
+            "psql -h localhost -X -qAt -v ON_ERROR_STOP=1 -f -"
+        )
+        output = self.run_remote_command(command, stdin_text=request["script"], cancel_event=cancel_event)
+        sections, current, cpu_count = {}, None, 1
+        for line in output.splitlines():
+            stripped = line.strip()
+            if current is None and stripped.isdigit():
+                cpu_count = int(stripped)
+            elif stripped == "PGDM_CATALOG" or stripped.startswith("PGDM_EXPLAIN "):
+                current = stripped
+            elif current is not None:
+                sections[current] = sections.get(current, "") + line + "\n"
+        return self._fast_plan_from_output(request, prepared, sections, cpu_count)
+
     def execute_cross_table_expansion(
         self,
         database_name: str,
@@ -13823,131 +14088,212 @@ SELECT json_build_object(
             5,
             "Validating source, destinations, and counters...",
         )
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Verify source table existence",
-        ):
-            source_exists = self.table_exists(
-                database_name,
-                source_full_table_name,
-                cancel_event=cancel_event,
+        fast_enabled = os.environ.get("PDM_FAST_EXPAND", "1") != "0"
+        fast_plan = None
+        if os.environ.get("PDM_BATCH_PREFLIGHT", "1") != "0":
+            fast_request = (
+                self._fast_plan_request(prepared, source_schema_name, source_table_name)
+                if fast_enabled
+                else None
             )
-        if not source_exists:
-            raise RuntimeError(
-                f"Source table {source_full_table_name} does not exist."
-            )
-
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Read and validate source column metadata",
-        ):
-            source_columns = {
-                item["name"]: item["type"]
-                for item in self.get_table_column_definitions(
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Batched preflight: source, Raw versions, function safety, counters, destinations",
+            ):
+                batched = self._batched_expansion_preflight(
+                    database_name,
+                    prepared,
+                    source_full_table_name,
+                    cancel_event=cancel_event,
+                    plan_script=fast_request["script"] if fast_request else "",
+                )
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Apply preflight validations",
+            ):
+                checks = batched["checks"]
+                if not checks.get("source_exists"):
+                    raise RuntimeError(
+                        f"Source table {source_full_table_name} does not exist."
+                    )
+                source_column_names = set(checks.get("source_columns") or [])
+                missing_source_columns = [
+                    column_name
+                    for column_name in ("raw_schema", "raw_hash")
+                    if column_name not in source_column_names
+                ]
+                if missing_source_columns:
+                    raise RuntimeError(
+                        f"Source {source_full_table_name} is missing required columns: "
+                        + ", ".join(missing_source_columns)
+                        + "."
+                    )
+                source_versions = batched["source_versions"]
+                referenced_raw_schemas = {
+                    str(item.get("raw_schema") or "").strip()
+                    for item in source_versions
+                    if isinstance(item, dict)
+                }
+                missing_version_schemas = [
+                    raw_schema
+                    for raw_schema in prepared["raw_schemas"]
+                    if raw_schema not in referenced_raw_schemas
+                ]
+                if missing_version_schemas:
+                    raise RuntimeError(
+                        "No Raw version is registered for the selected scope: "
+                        + ", ".join(missing_version_schemas)
+                        + "."
+                    )
+                if checks.get("functions") is not None:
+                    self._check_expansion_function_metadata(checks.get("functions"))
+                self._data_metadata_ready_databases.add(database_name)
+                for destination in prepared["destinations"]:
+                    full_table_name = destination["table_name"]
+                    key = f"{destination['schema_name']}.{destination['pure_table_name']}"
+                    if not (checks.get("destinations") or {}).get(key, {}).get("exists"):
+                        raise RuntimeError(
+                            f"Destination table {full_table_name} does not exist."
+                        )
+                    self._check_managed_dependencies_metadata(
+                        (checks.get("dependencies") or {}).get(key) or {},
+                        {"insert"},
+                        False,
+                    )
+                if fast_request:
+                    fast_plan = self._fast_plan_from_output(
+                        fast_request,
+                        prepared,
+                        batched["sections"],
+                        batched["cpu_count"],
+                    )
+        else:
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Verify source table existence",
+            ):
+                source_exists = self.table_exists(
                     database_name,
                     source_full_table_name,
                     cancel_event=cancel_event,
                 )
-            }
-        missing_source_columns = [
-            column_name
-            for column_name in ("raw_schema", "raw_hash")
-            if column_name not in source_columns
-        ]
-        if missing_source_columns:
-            raise RuntimeError(
-                f"Source {source_full_table_name} is missing required columns: "
-                + ", ".join(missing_source_columns)
-                + "."
-            )
-
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Load Raw version references for the selected scope",
-        ):
-            source_versions = self.get_raw_schema_version_references(
-                database_name,
-                source_full_table_name,
-                prepared["raw_schemas"],
-                cancel_event=cancel_event,
-            )
-        referenced_raw_schemas = {
-            str(item.get("raw_schema") or "").strip()
-            for item in source_versions
-            if isinstance(item, dict)
-        }
-        missing_version_schemas = [
-            raw_schema
-            for raw_schema in prepared["raw_schemas"]
-            if raw_schema not in referenced_raw_schemas
-        ]
-        if missing_version_schemas:
-            raise RuntimeError(
-                "No Raw version is registered for the selected scope: "
-                + ", ".join(missing_version_schemas)
-                + "."
-            )
-
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Validate SQL function safety",
-        ):
-            self._validate_cross_table_expansion_functions(
-                database_name,
-                prepared["destinations"],
-                cancel_event=cancel_event,
-            )
-        with self.expansion_timing_scope(
-            timing_report,
-            "preflight",
-            "Ensure data-database metadata and row counters",
-        ):
-            self.ensure_data_database_metadata(
-                database_name,
-                cancel_event=cancel_event,
-            )
-        for destination in prepared["destinations"]:
-            full_table_name = destination["table_name"]
-            with self.expansion_timing_scope(
-                timing_report,
-                "preflight",
-                f"Verify destination {full_table_name}",
-            ):
-                destination_exists = self.table_exists(
-                    database_name,
-                    full_table_name,
-                    cancel_event=cancel_event,
-                )
-            if not destination_exists:
+            if not source_exists:
                 raise RuntimeError(
-                    f"Destination table {full_table_name} does not exist."
-                )
-            with self.expansion_timing_scope(
-                timing_report,
-                "preflight",
-                f"Read row counter for {full_table_name}",
-            ):
-                self.get_table_row_count(
-                    database_name,
-                    full_table_name,
-                    cancel_event=cancel_event,
-                )
-            with self.expansion_timing_scope(
-                timing_report,
-                "preflight",
-                f"Validate managed dependencies for {full_table_name}",
-            ):
-                self._validate_managed_sql_dependencies(
-                    database_name,
-                    full_table_name,
-                    {"insert"},
-                    cancel_event=cancel_event,
+                    f"Source table {source_full_table_name} does not exist."
                 )
 
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Read and validate source column metadata",
+            ):
+                source_columns = {
+                    item["name"]: item["type"]
+                    for item in self.get_table_column_definitions(
+                        database_name,
+                        source_full_table_name,
+                        cancel_event=cancel_event,
+                    )
+                }
+            missing_source_columns = [
+                column_name
+                for column_name in ("raw_schema", "raw_hash")
+                if column_name not in source_columns
+            ]
+            if missing_source_columns:
+                raise RuntimeError(
+                    f"Source {source_full_table_name} is missing required columns: "
+                    + ", ".join(missing_source_columns)
+                    + "."
+                )
+
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Load Raw version references for the selected scope",
+            ):
+                source_versions = self.get_raw_schema_version_references(
+                    database_name,
+                    source_full_table_name,
+                    prepared["raw_schemas"],
+                    cancel_event=cancel_event,
+                )
+            referenced_raw_schemas = {
+                str(item.get("raw_schema") or "").strip()
+                for item in source_versions
+                if isinstance(item, dict)
+            }
+            missing_version_schemas = [
+                raw_schema
+                for raw_schema in prepared["raw_schemas"]
+                if raw_schema not in referenced_raw_schemas
+            ]
+            if missing_version_schemas:
+                raise RuntimeError(
+                    "No Raw version is registered for the selected scope: "
+                    + ", ".join(missing_version_schemas)
+                    + "."
+                )
+
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Validate SQL function safety",
+            ):
+                self._validate_cross_table_expansion_functions(
+                    database_name,
+                    prepared["destinations"],
+                    cancel_event=cancel_event,
+                )
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Ensure data-database metadata and row counters",
+            ):
+                self.ensure_data_database_metadata(
+                    database_name,
+                    cancel_event=cancel_event,
+                )
+            for destination in prepared["destinations"]:
+                full_table_name = destination["table_name"]
+                with self.expansion_timing_scope(
+                    timing_report,
+                    "preflight",
+                    f"Verify destination {full_table_name}",
+                ):
+                    destination_exists = self.table_exists(
+                        database_name,
+                        full_table_name,
+                        cancel_event=cancel_event,
+                    )
+                if not destination_exists:
+                    raise RuntimeError(
+                        f"Destination table {full_table_name} does not exist."
+                    )
+                with self.expansion_timing_scope(
+                    timing_report,
+                    "preflight",
+                    f"Read row counter for {full_table_name}",
+                ):
+                    self.get_table_row_count(
+                        database_name,
+                        full_table_name,
+                        cancel_event=cancel_event,
+                    )
+                with self.expansion_timing_scope(
+                    timing_report,
+                    "preflight",
+                    f"Validate managed dependencies for {full_table_name}",
+                ):
+                    self._validate_managed_sql_dependencies(
+                        database_name,
+                        full_table_name,
+                        {"insert"},
+                        cancel_event=cancel_event,
+                    )
         self._notify_progress(
             progress_callback,
             "preflight",
@@ -13958,6 +14304,20 @@ SELECT json_build_object(
             ),
         )
         self._raise_if_cancelled(cancel_event)
+
+        if fast_enabled and fast_plan is None and os.environ.get("PDM_BATCH_PREFLIGHT", "1") == "0":
+            with self.expansion_timing_scope(
+                timing_report,
+                "preflight",
+                "Inspect destination catalog and plan parallel execution",
+            ):
+                fast_plan = self._plan_fast_expansion(
+                    database_name,
+                    prepared,
+                    source_schema_name,
+                    source_table_name,
+                    cancel_event=cancel_event,
+                )
 
         with self.expansion_timing_scope(
             timing_report,
@@ -14061,11 +14421,53 @@ FROM pg_temp.pgdm_expansion_timings;
                 + timing_result_sql
                 + "\nDROP TABLE pg_temp.pgdm_expansion_timings;\n"
             )
-        command = (
-            f"psql -h localhost -U {shlex.quote(self.sql_username)} "
-            f"-d {shlex.quote(database_name)} "
-            "-X -qAt -v ON_ERROR_STOP=1 -f -"
-        )
+            if fast_plan is not None and fast_plan["plan"].parallel:
+                wrapped_sql = fast_expansion.render(
+                    fast_plan["plan"],
+                    fast_plan["catalog"],
+                    source_schema_name,
+                    source_table_name,
+                    fast_plan["source_sql"],
+                    fast_plan["job_id"],
+                    fast_plan["job_dir"],
+                    manifest_sql,
+                    destination_lock_sql,
+                    timing_table_sql,
+                    timing_result_sql,
+                    DATA_TABLE_ROW_COUNTS,
+                    lambda statement, schema_name, table_name, sequence, name, destination, index: (
+                        self._build_managed_dml_sql(
+                            statement,
+                            schema_name,
+                            table_name,
+                            "add",
+                            timing_sequence=sequence,
+                            timing_stage="execute",
+                            timing_name=name,
+                            timing_destination=destination,
+                            timing_statement_index=index,
+                        )
+                    ),
+                    {
+                        "PGHOST": "localhost",
+                        "PGUSER": self.sql_username,
+                        "PGDATABASE": database_name,
+                    },
+                )
+        if fast_plan is not None and fast_plan["plan"].parallel:
+            # The runner is staged to a private temporary file first: it starts psql sessions and
+            # shell commands of its own, which must not consume the script from the SSH stdin.
+            command = (
+                'pgdm_runner="$(mktemp)"; cat > "$pgdm_runner"; '
+                'bash "$pgdm_runner" </dev/null; pgdm_status=$?; '
+                'rm -f "$pgdm_runner"; exit $pgdm_status'
+            )
+        else:
+            command = (
+                f"psql -h localhost -U {shlex.quote(self.sql_username)} "
+                f"-d {shlex.quote(database_name)} "
+                "-X -qAt -v ON_ERROR_STOP=1 -f -"
+            )
         self._notify_progress(
             progress_callback,
             "execute",
