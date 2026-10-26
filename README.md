@@ -1,5 +1,8 @@
 # PostgreSQL Data Manager
 
+> **Expand optimisation:** parallel, pipelined and recoverable Expand - 5.6x faster at 10M rows with identical
+> output. See [REPORT.md](REPORT.md).
+
 PostgreSQL Data Manager is a desktop application for browsing and administering PostgreSQL databases through an SSH connection. It includes table previews, imports, version history, controlled destructive actions, data-dictionary tooling, dumps, restores, and role management.
 
 ## PostgreSQL setup
