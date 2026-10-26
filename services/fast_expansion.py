@@ -381,6 +381,11 @@ SELECT json_build_object(
   'connections_in_use', (SELECT count(*) FROM pg_stat_activity),
   'can_create_schema', has_database_privilege(current_database(), 'CREATE'),
   'search_path', current_setting('search_path'),
+  'synchronize_seqscans', current_setting('synchronize_seqscans') = 'on',
+  'syncscan_threshold_bytes', (SELECT setting::bigint * current_setting('block_size')::bigint / 4
+                               FROM pg_settings WHERE name = 'shared_buffers'),
+  'source_bytes', (SELECT pg_relation_size(c.oid) FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                   WHERE n.nspname = {ql(source_schema)} AND c.relname = {ql(source_table)}),
   'source_blocks', (SELECT pg_relation_size(c.oid) / current_setting('block_size')::int
                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
                     WHERE n.nspname = {ql(source_schema)} AND c.relname = {ql(source_table)}),
@@ -444,6 +449,7 @@ class Plan:
         self.units = 1              # source block ranges per parallel segment
         self.bulk = {}              # (schema, table) -> drop/recreate secondary structures
         self.reasons = []           # why the whole job is serial (if it is)
+        self.exact_ids = True       # whether the original's identity values are reproducible at all
 
     @property
     def parallel(self) -> bool:
@@ -464,7 +470,8 @@ def distinct_statements(prepared: dict, source_sql: str, catalog: dict) -> list[
 
 
 def build_plan(prepared: dict, source_sql: str, catalog: dict, worker_slots: int,
-               hashed_distinct: set[int] = frozenset(), min_rows_per_unit: int = 5_000) -> Plan:
+               hashed_distinct: set[int] = frozenset(), min_rows_per_unit: int = 5_000,
+               max_rows_per_unit: int = 400_000) -> Plan:
     plan = Plan()
     if catalog.get("server_version_num", 0) < 140000:
         plan.reasons.append("PostgreSQL < 14 has no TID range scans")
@@ -474,6 +481,14 @@ def build_plan(prepared: dict, source_sql: str, catalog: dict, worker_slots: int
     if len({k[1] for k in dest_meta}) != len(dest_meta):
         plan.reasons.append("two destinations share a table name")
     aggregates = set(catalog.get("aggregate_names") or [])
+    # The original's surrogate keys are reproducible only while its sequential scans of the source start
+    # at block 0. Above a quarter of shared_buffers PostgreSQL synchronises sequential scans, so the
+    # original's own insert order (hence its identity values) depends on earlier scans' positions; then
+    # only the logical content is reproducible and order-motivated serial fallbacks are pointless.
+    plan.exact_ids = (not catalog.get("synchronize_seqscans", True)
+                      or int(catalog.get("source_bytes") or 0) < int(catalog.get("syncscan_threshold_bytes") or 0))
+    if not plan.exact_ids:
+        hashed_distinct = frozenset()
     parallel_seen = serial_tail = False
     for di, dest in enumerate(prepared["destinations"]):
         key = (dest["schema_name"], dest["pure_table_name"])
@@ -520,7 +535,9 @@ def build_plan(prepared: dict, source_sql: str, catalog: dict, worker_slots: int
     if rows <= 0:
         rows = int(catalog.get("source_blocks") or 0) * 4
     plan.workers = max(1, min(worker_slots, rows // min_rows_per_unit or 1))
-    plan.units = plan.workers
+    # bounded ranges: per-range sorts stay in memory, joins against staged rows stay index lookups,
+    # and a checkpoint never holds more than ~max_rows_per_unit source rows of work
+    plan.units = max(plan.workers, -(-rows // max_rows_per_unit))
     for key, meta in dest_meta.items():
         grows = any(s["key"] == key and s["mode"] != "serial" for s in plan.segments)
         plan.bulk[key] = (grows and bool(meta["owned"]) and _bulk_safe(meta, dest_meta)
@@ -738,6 +755,7 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
     if restore_sql:
         t.around(200, "Rebuild indexes and validate foreign keys",
                  "SET LOCAL work_mem = '256MB';\nSET LOCAL maintenance_work_mem = '1GB';\n"
+                 "SET LOCAL random_page_cost = 1.1;\n"
                  f"SET LOCAL max_parallel_maintenance_workers = {max(0, min(8, plan.workers - 1))};\n" + restore_sql)
     if par:
         t.around(201, "Advance identity sequences", _sequence_sql(xs, par, dest_meta, seq_col))
@@ -774,6 +792,9 @@ def _unit_file(files, xs, job_id, table, sql, search_path) -> str:
         "SET max_parallel_workers_per_gather = 0;\n"
         "SET synchronize_seqscans = off;\n"
         "SET work_mem = '64MB';\n"
+        # cost hint only (results unchanged): staged and destination rows are cached / on SSD, so joins of a
+        # block range against an indexed staged relation are index lookups, not a full re-hash per range
+        "SET random_page_cost = 1.1;\n"
         f"SELECT set_config('search_path', {ql(qi(xs) + ', ' + search_path)}, false) AS search_path \\gset\n"
         f"SELECT EXISTS (SELECT 1 FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND unit_id = {ql(table)} "
         "AND state = 'done') AS unit_done \\gset\n"
