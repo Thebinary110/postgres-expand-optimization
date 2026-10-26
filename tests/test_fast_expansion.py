@@ -219,7 +219,8 @@ class RenderTests(unittest.TestCase):
                     if name.startswith("w") and '"s5_u0"' in text)
         self.assertIn("ctid >= '(0,0)'::tid", unit)
         self.assertIn('"pgdm_xs_jobid".table1', unit)                       # reads the staged view of table1
-        self.assertIn("ORDER BY __src, __e", unit)                          # original emission order
+        order = unit[unit.index('"s5_u0" ("id_column_2"'):].split("ORDER BY ", 1)[1].split(";", 1)[0]
+        self.assertTrue(order.startswith("__src, ") and order.endswith(", __e"), order)  # plan-independent order
         reduce = files["s0_r0.sql"]                                         # DISTINCT reduce
         self.assertIn("SELECT DISTINCT c1, c2, c3, c4, c5", reduce)
         self.assertIn("ORDER BY 1, 2, 3, 4, 5", reduce)

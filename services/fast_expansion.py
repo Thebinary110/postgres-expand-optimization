@@ -34,6 +34,7 @@ import io
 import json
 import os
 import tarfile
+import uuid
 import re
 import shlex
 
@@ -231,6 +232,15 @@ def analyse_statement(statement: str, source_sql: str, aggregate_names: set[str]
 
 _NOT_ALIAS = {"where", "join", "inner", "left", "right", "full", "cross", "natural", "on", "using", "group",
               "order", "limit", "offset", "window", "union", "intersect", "except", "for", "fetch", "lateral"}
+
+
+_SORTABLE_TYPES = ("smallint", "integer", "bigint", "numeric", "real", "double precision", "text", "character",
+                   "character varying", "date", "time", "timestamp", "interval", "boolean", "uuid", "bytea", "jsonb")
+
+
+def _sortable(type_name: str) -> bool:
+    """Destination types with a default btree ordering (used only as deterministic tie-breakers)."""
+    return type_name.split("(")[0].strip().startswith(_SORTABLE_TYPES) and not type_name.endswith("[]")
 
 
 def _top_level_from(query: str) -> int:
@@ -777,6 +787,7 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
     if current:
         waves.append(current)
     wave_of = {seg["name"]: k for k, wave in enumerate(waves) for seg in wave}
+    attempt = uuid.uuid4().hex[:12]
     json_columns = set(catalog.get("source_json_columns") or []) if os.environ.get("PDM_FAST_CSE", "1") != "0" else set()
     source_columns = list(catalog.get("source_columns") or [])
     if not source_columns:
@@ -813,11 +824,15 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
             with_ctid = body[:cut].rstrip() + f",\n    {seg['source_alias']}.__pgdm_ctid\n" + body[cut:]
             sel_ctid = rewrite_relations(with_ctid.replace(source_sql, ranged_ctid), managed_rel)
             cols = [f"c{k + 1}" for k in range(len(seg["columns"]))]
+            # Order: source position, then (several rows per source row) the row's own values in the
+            # destination types, then emission order - deterministic whatever join strategy the worker's
+            # planner picks (a hash join may reverse rows that share a key)
+            ties = [f"{c}::{coltypes[col]}" for c, col in zip(cols, seg["columns"]) if _sortable(coltypes[col])]
             sql = (f"CREATE UNLOGGED TABLE {target} ({stage_cols}, __rn bigint GENERATED ALWAYS AS IDENTITY);\n"
                    f"INSERT INTO {target} ({', '.join(qi(c) for c in seg['columns'])})\n"
                    f"SELECT {', '.join(cols)} FROM (\n"
                    f"  SELECT x.*, row_number() OVER () AS __e FROM (\n{sel_ctid}\n  ) AS x({', '.join(cols)}, __src)\n"
-                   f") AS y ORDER BY __src, __e;\n")
+                   f") AS y ORDER BY {', '.join(['__src'] + ties + ['__e'])};\n")
         else:  # partial DISTINCT, in the SELECT's own output types
             sel = rewrite_relations(body.replace(source_sql, ranged), managed_rel)
             aliases = ", ".join(f"c{k + 1}" for k in range(len(seg["columns"])))
@@ -857,11 +872,16 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
         files[f"phase_w{k}.reduce"] = "".join(f + "\n" for f in reduce_files)
         files[f"phase_w{k}.post"] = "".join(f + "\n" for f in post_files)
         files[f"phase_w{k}.next"] = (f"w{k + 1}_views.sql\n" if k + 1 < len(waves) else "\n")
+        # keyed by this attempt's nonce: a marker left by an interrupted earlier attempt never counts
+        files[f"phase_w{k}.finished.sql"] = (f"INSERT INTO {qi(xs)}.phase_done VALUES ({ql(f'w{k}:{attempt}')}) "
+                                             "ON CONFLICT DO NOTHING;\n")
 
     # ---- coordinator ------------------------------------------------------------------------------
     t = _Timings()
     co = [timing_table_sql,
-          "SET idle_in_transaction_session_timeout = 0;", "SET statement_timeout = 0;", "SET lock_timeout = 0;"]
+          "SET idle_in_transaction_session_timeout = 0;", "SET statement_timeout = 0;", "SET lock_timeout = 0;",
+          # if the coordinator's own psql dies, its backend notices within a second and rolls back
+          "SET client_connection_check_interval = '1s';"]
     co += job_setup_step(job_dir, job_id, "w0_views.sql" if par else None)
     co.append("BEGIN;")
     t.around(1, "Initialize database transaction",
@@ -987,12 +1007,9 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
             wait_acc[k] = nxt()
             for u in range(len(ranges)) if streamed else []:
                 # wait for range u (ranges finish roughly in order), then insert it while the rest computes
-                t.lines.append("SELECT clock_timestamp() AS pgdm_t0 \\gset")
-                t.lines.append(f"\\! bash {shlex.quote(job_dir)}/phase.sh w{k} waitunit w{k}_u{u}.sql")
-                t.lines.append(f"INSERT INTO pg_temp.pgdm_stream_acc VALUES ({wait_acc[k]}, "
-                               f"{ql(wave_name[k] + ': waits for ranges between streamed inserts')}, NULL, NULL, "
-                               "extract(epoch FROM clock_timestamp() - :'pgdm_t0'::timestamptz), NULL) "
-                               "ON CONFLICT (sequence_number) DO UPDATE SET seconds = pgdm_stream_acc.seconds + EXCLUDED.seconds;")
+                t.lines.append(_wait_range_sql(xs, job_id, [f"{seg['name']}_u{u}" for seg in streamed],
+                                               f"w{k}:{attempt}", wait_acc[k],
+                                               wave_name[k] + ": waits for ranges between streamed inserts"))
                 for seg in streamed:
                     t.lines.append(_stream_unit_sql(xs, job_id, seg, dest_meta[seg["key"]], u, acc[seg["name"]]))
             t.around(nxt(), wave_name[k] + ": wait (after the overlapped coordinator work above)",
@@ -1058,6 +1075,7 @@ def render(plan: Plan, catalog: dict, source_schema: str, source_table: str, sou
 def _unit_header(xs, search_path) -> str:
     return (
         "\\set ON_ERROR_STOP 1\n"
+        f"SET application_name = {ql('pgdm_worker_' + xs[len(STAGE_SCHEMA_PREFIX):])};\n"
         "SET client_min_messages = warning;\n"
         "SET max_parallel_workers_per_gather = 0;\n"
         "SET synchronize_seqscans = off;\n"
@@ -1200,6 +1218,35 @@ def _stream_first_sql(xs, seg, seq_column) -> str:
             f"{qi(xs)}.unit_offsets WHERE segment = {ql(seg['name'])} LIMIT 1), {nxt}), {inc});")
 
 
+def _wait_range_sql(xs, job_id, unit_ids, phase_key, acc_seq, acc_name) -> str:
+    """Wait inside the coordinator's session (no shell per range) until the range's checkpoints are
+    committed; if the phase finishes without them, fail (the verification would fail anyway)."""
+    units = ", ".join(ql(u) for u in unit_ids)
+    return f"""DO $pgdm_wait$
+DECLARE
+    pgdm_started timestamptz := clock_timestamp();
+    pgdm_last_worker timestamptz := clock_timestamp();
+BEGIN
+    WHILE (SELECT count(*) FROM {qi(JOB_SCHEMA)}.units WHERE job_id = {ql(job_id)} AND unit_id IN ({units})
+           AND state = 'done') < {len(unit_ids)} LOOP
+        IF EXISTS (SELECT 1 FROM {qi(xs)}.phase_done WHERE phase = {ql(phase_key)}) THEN
+            RAISE EXCEPTION 'Parallel expansion ranges did not complete: %', {ql(", ".join(unit_ids))};
+        END IF;
+        -- the workers vanished (killed with their phase): stop waiting; the checkpoints stay resumable
+        IF EXISTS (SELECT 1 FROM pg_stat_activity WHERE application_name = {ql('pgdm_worker_' + job_id)}) THEN
+            pgdm_last_worker := clock_timestamp();
+        ELSIF clock_timestamp() - pgdm_last_worker > interval '10 seconds' THEN
+            RAISE EXCEPTION 'The parallel workers of this expansion stopped before finishing: %', {ql(", ".join(unit_ids))};
+        END IF;
+        PERFORM pg_sleep(0.01);
+    END LOOP;
+    INSERT INTO pg_temp.pgdm_stream_acc VALUES ({acc_seq}, {ql(acc_name)}, NULL, NULL,
+        extract(epoch FROM clock_timestamp() - pgdm_started), NULL)
+    ON CONFLICT (sequence_number) DO UPDATE SET seconds = pgdm_stream_acc.seconds + EXCLUDED.seconds;
+END
+$pgdm_wait$;"""
+
+
 def _stream_unit_sql(xs, job_id, seg, meta, u, acc_seq) -> str:
     """Insert one finished range of a segment while later ranges are still being computed. Its identity
     offset is the row count of the segment's earlier ranges (committed checkpoints)."""
@@ -1334,6 +1381,7 @@ def _setup_sql(xs, job_id, par, nranges, copies=()) -> str:
     return (
         "\\set ON_ERROR_STOP 1\nSET client_min_messages = warning;\nBEGIN;\n"
         f"CREATE SCHEMA IF NOT EXISTS {qi(xs)};\n"
+        f"CREATE TABLE IF NOT EXISTS {qi(xs)}.phase_done (phase text PRIMARY KEY);\n"
         f"CREATE TABLE IF NOT EXISTS {qi(xs)}.unit_offsets (segment text NOT NULL, unit int NOT NULL, "
         "unit_rows bigint NOT NULL, unit_offset bigint NOT NULL, first_value bigint NOT NULL, "
         "increment_by bigint NOT NULL, PRIMARY KEY (segment, unit));\n"
@@ -1351,17 +1399,24 @@ def _phase_script(workers) -> str:
 set -u
 d="$(cd "$(dirname "$0")" && pwd)"; seg="$1"; mode="${{2:-}}"
 # bg: run this phase detached and mark it done at the end; wait: block until the phase is marked done
-if [ "$mode" = bg ]; then rm -f "$d/phase_$seg.done" "$d/${{seg}}_u"*.sql.done; nohup bash "$0" "$seg" mark >/dev/null 2>&1 & exit 0; fi
-if [ "$mode" = wait ]; then while [ ! -f "$d/phase_$seg.done" ]; do sleep 0.02; done; exit 0; fi
-# waitunit <unit file>: until that range is finished (or the whole phase is, e.g. after a failure)
-if [ "$mode" = waitunit ]; then while [ ! -f "$d/$3.done" ] && [ ! -f "$d/phase_$seg.done" ]; do sleep 0.01; done; exit 0; fi
-run() {{ psql -X -q -v ON_ERROR_STOP=1 -f "$d/$1" >>"$d/workers.log" 2>&1 || echo "FAILED $1" >>"$d/workers.log"; touch "$d/$1.done"; }}
+if [ "$mode" = bg ]; then rm -f "$d/phase_$seg.done"; nohup bash "$0" "$seg" mark >/dev/null 2>&1 & echo $! > "$d/phase_$seg.pid"; exit 0; fi
+if [ "$mode" = wait ]; then
+  p=$(cat "$d/phase_$seg.pid" 2>/dev/null)
+  while [ ! -f "$d/phase_$seg.done" ]; do
+    kill -0 "$p" 2>/dev/null || exit 1   # phase process gone: the checkpoint verification will fail
+    sleep 0.02
+  done
+  exit 0
+fi
+run() {{ psql -X -q -v ON_ERROR_STOP=1 -f "$d/$1" >>"$d/workers.log" 2>&1 || echo "FAILED $1" >>"$d/workers.log"; }}
 export -f run; export d
 xargs -a "$d/phase_$seg.list" -P {workers} -I{{}} bash -c 'run "$1"' _ {{}}
 while read -r f; do [ -n "$f" ] && run "$f"; done < "$d/phase_$seg.reduce"
 while read -r f; do [ -n "$f" ] && run "$f"; done < "$d/phase_$seg.post"
 nv="$(tr -d '\\n' < "$d/phase_$seg.next")"
 if [ -n "$nv" ]; then run "$nv"; fi
+# committed marker: a coordinator waiting for a range in SQL stops waiting (and fails) if the range never finishes
+psql -X -q -f "$d/phase_$seg.finished.sql" >>"$d/workers.log" 2>&1
 if [ "$mode" = mark ]; then touch "$d/phase_$seg.done"; fi
 exit 0
 """
