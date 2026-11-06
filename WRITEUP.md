@@ -1,6 +1,13 @@
 # Parallel, resumable Expand: 5.6–6.3× faster, same output, survives every failure we could inject
 
-**Submission commit:** `c8c6294f4aef446d20bc602b48d2504be9489004` (code; later commits change documentation only). Full engineering report: [REPORT.md](REPORT.md).
+**Repository:** https://github.com/Thebinary110/postgres-expand-optimization (branch `fast-expansion`; based on the
+challenge repository's `main` at `5dfde9d`).
+**Submission commit:** `c8c6294f4aef446d20bc602b48d2504be9489004` (code; later commits change documentation only).
+Full engineering report: [REPORT.md](REPORT.md).
+
+To review exactly what was measured: `git clone <repository> && git checkout c8c6294`. The application is started
+the same way as the original (`python main.py`); the Expand button runs the new path, and `PDM_FAST_EXPAND=0`
+restores the original serial code for side-by-side checks.
 
 ## Summary
 
@@ -15,6 +22,21 @@ source manifest, version registration) and changes *how* the work is executed:
   indexes rebuilt once instead of maintained row by row;
 * the job runs detached on the server with committed checkpoints, so a lost client, a killed job, a cancel or a
   PostgreSQL crash never loses finished work and never commits wrong data.
+
+## How the submission maps to the scoring
+
+| Criterion | Where the evidence is |
+|---|---|
+| Speed (MEASURED PROCESSING TOTAL) | results table below: 3.4x at 100k, 6.0x at 1M, 5.6x at 10M, 6.3x at 50M rows, application's own report |
+| Checkpoint / resume | "Failure recovery": nine injected failure scenarios (twelve runs), every one ending identical to the untouched original, log in `bench/evidence/` |
+| RAM and temporary disk | "Resources" paragraph below and "Trade-offs": spill files 0.65 GB at 10M (original 0.65 GB), WAL 6.4 GB (original 8.6 GB), staging about one copy of the output, released at commit |
+
+**Gates kept:** the six destination tables, the row counters and the version registry are identical to the
+original's (exact and logical fingerprints, surrogate keys included up to 1M rows and identical rows above);
+validation, function-safety checks, managed row counters, the single atomic data commit, the source manifest and
+version registration are all still performed; `generate_database.py`, `GENERATE_DATABASE_README.md`, the six
+recipes in `SQL files/` and the fixed seed are untouched (`git diff 5dfde9d c8c6294 -- generate_database.py
+"SQL files"` is empty).
 
 ## Results (MEASURED PROCESSING TOTAL, application's own report)
 
@@ -100,3 +122,14 @@ keys. There this submission assigns keys deterministically in source order and p
 `bench/fingerprint.sql` / `bench/control_fingerprint.sql` (output and registry fingerprints),
 `bench/recovery_suite.sh` (failure scenarios), `bench/monitor.sh` (resource sampler). `PDM_FAST_EXPAND=0`
 forces the original serial path.
+
+**Quick start** (any PostgreSQL 16 host reachable over SSH; `bench/server/` is the image the numbers above used):
+
+1. Generate the database with the unchanged upstream generator, as described in `GENERATE_DATABASE_README.md`.
+2. Run the headless Expand; credentials come only from the environment:
+   `PDM_SSH_HOST=... PDM_SSH_PORT=... PDM_SSH_USER=... PDM_SSH_PASSWORD=... PDM_PG_PORT=... PDM_PG_USER=... PDM_PG_PASSWORD=... python bench/headless_expand.py --database kaggle_challenge --report fast.txt`
+3. Restore the same snapshot and run the original path for comparison: the same command with `PDM_FAST_EXPAND=0 ... --report original.txt`.
+4. Compare `MEASURED PROCESSING TOTAL` in the two reports, then `psql -f bench/fingerprint.sql` and
+   `psql -f bench/control_fingerprint.sql` on both databases: the fingerprints must match.
+5. `bench/recovery_suite.sh <snapshot> <results dir>` replays the failure scenarios S0-S9 (needs the helper
+   scripts described in its header); `python -m pytest tests/test_fast_expansion.py` runs the unit tests.

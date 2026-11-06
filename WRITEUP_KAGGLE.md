@@ -1,0 +1,135 @@
+# Parallel, resumable Expand: 5.6–6.3× faster, same output, survives every failure we could inject
+
+**Repository:** https://github.com/Thebinary110/postgres-expand-optimization (branch `fast-expansion`; based on the
+challenge repository's `main` at `5dfde9d`).
+**Submission commit:** `c8c6294f4aef446d20bc602b48d2504be9489004` (code; later commits change documentation only).
+Full engineering report: [REPORT.md](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/REPORT.md).
+
+To review exactly what was measured: `git clone <repository> && git checkout c8c6294`. The application is started
+the same way as the original (`python main.py`); the Expand button runs the new path, and `PDM_FAST_EXPAND=0`
+restores the original serial code for side-by-side checks.
+
+## Summary
+
+The DB Manager's Expand step turns `raw_data.raw` (JSONB) into six relational tables with the six challenge
+recipes, in one transaction, on one CPU core. This submission keeps the recipes, the generator, the seed and every
+guarantee of the original (validation, function-safety checks, managed row counters, one atomic data commit, the
+source manifest, version registration) and changes *how* the work is executed:
+
+* the recipes are analysed and every provably row-local statement runs in parallel over physical source ranges,
+  on many PostgreSQL sessions, into unlogged staging tables;
+* staged rows are streamed into the destinations inside **one** coordinator transaction, with constraints and
+  indexes rebuilt once instead of maintained row by row;
+* the job runs detached on the server with committed checkpoints, so a lost client, a killed job, a cancel or a
+  PostgreSQL crash never loses finished work and never commits wrong data.
+
+## How the submission maps to the scoring
+
+| Criterion | Where the evidence is |
+|---|---|
+| Speed (MEASURED PROCESSING TOTAL) | results table below: 3.4x at 100k, 6.0x at 1M, 5.6x at 10M, 6.3x at 50M rows, application's own report |
+| Checkpoint / resume | "Failure recovery": nine injected failure scenarios (twelve runs), every one ending identical to the untouched original, log in [`bench/evidence/`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/evidence/) |
+| RAM and temporary disk | "Resources" paragraph below and "Trade-offs": spill files 0.65 GB at 10M (original 0.65 GB), WAL 6.4 GB (original 8.6 GB), staging about one copy of the output, released at commit |
+
+**Gates kept:** the six destination tables, the row counters and the version registry are identical to the
+original's (exact and logical fingerprints, surrogate keys included up to 1M rows and identical rows above);
+validation, function-safety checks, managed row counters, the single atomic data commit, the source manifest and
+version registration are all still performed; `generate_database.py`, `GENERATE_DATABASE_README.md`, the six
+recipes in `SQL files/` and the fixed seed are untouched (`git diff 5dfde9d c8c6294 -- generate_database.py
+"SQL files"` is empty).
+
+## Results (MEASURED PROCESSING TOTAL, application's own report)
+
+| Rows | Original (untouched code) | This submission | Speed-up | Output vs original |
+|---:|---:|---:|---:|---|
+| 100,000 | 6.45 s | **1.88 s** | 3.4× | byte-identical, identity values included |
+| 1,000,000 | 59.5 s | **9.9 s** | 6.0× | byte-identical, identity values included |
+| 10,000,000 | 10 min 12 s | **1 min 49 s** | 5.6× | identical rows (see "Identity values") |
+| 50,000,000 | 59 min 43 s | **9 min 32 s** | 6.3× | identical rows; `table2` (116M rows) and `table5` byte-identical |
+
+Same server, same snapshot for every run (PostgreSQL 16 in Docker, 16 CPUs, 32 GB, `shared_buffers=4GB`; ARM,
+20 cores). Output equality is checked with an exact hash of every table (all columns, surrogate keys included), a
+logical hash (surrogate keys replaced by natural keys), the row-counter table, and a hash of the version registry.
+
+**Resources at 10M rows:** peak process memory 2.6 GB (original 0.34 GB), spill files 0.65 GB (same as the
+original), staging 4.9 GB (about one extra copy of the output, unlogged, released at commit), WAL 6.4 GB (original
+8.6 GB). At 50M: 2.2 GB memory, 3.5 GB spill, 24.7 GB staging.
+
+## What made it fast
+
+1. **Parallel row-local statements.** An SQL lexer classifies each recipe statement. Statements whose output rows
+   each depend on one source row run per TID range (`ctid` range scans) on N sessions; independent statements share
+   one pass over the source ("waves"). `DISTINCT` and other global statements stay serial where order matters.
+2. **JSON path hoisting.** Repeated `raw -> 'values' ->> 'x'` lookups are computed once per row into narrow
+   columns behind an optimisation fence, which also cut spill files from 20 GB to 0.65 GB at 10M rows.
+3. **Bulk constraint handling.** Foreign keys, primary keys and unique indexes are dropped inside the transaction
+   and rebuilt (and validated) once, instead of firing an RI trigger and an index update per row.
+4. **Pipelined coordinator.** Destinations are filled range by range while later ranges are still being
+   computed; identity values are pre-assigned per range with offsets so they equal what the serial `nextval()`
+   calls would have produced.
+5. **Batched preflight.** About 35 SSH round trips (each a shell, psql start-up and SCRAM login) became one
+   command with the control and data sessions running concurrently.
+
+## Failure recovery (secondary goal)
+
+| Failure | Original | This submission |
+|---|---|---|
+| Client / SSH lost mid-run | transaction aborted, all work lost | job keeps running on the server; next connection registers it |
+| Client lost after the data commit | data committed **without** version records | registered on reconnect, exactly once |
+| Server-side job killed | everything recomputed | rerun resumes from committed checkpoints, same identity values |
+| Cancel | rollback | rollback; checkpoints kept, rerun resumes |
+| PostgreSQL crash | everything recomputed | crash-emptied staging detected and recomputed, never committed empty |
+| Source changes between attempts | – | checkpoints refused (change token), fresh job, reserved identity values given back |
+
+**Validated on the submission commit** ([`bench/recovery_suite.sh`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/recovery_suite.sh), 1M rows, every scenario compared with the
+untouched original's destinations *and* version registry):
+
+| # | Injected failure | State right after the failure | Result after reconnect / rerun |
+|---|---|---|---|
+| S0 | none (clean run, 9.6 s vs 58.2 s) | – | identical |
+| S1 | client killed mid-run | job keeps running on the server and commits | registered on reconnect; identical |
+| S2 | client lost after the commit; two clients reconnect at once | data committed, versions pending | registered exactly once; identical |
+| S3 | job killed 1 s / 3 s / 5 s in | 52, 102, 122 of 122 checkpoints; 0 destination rows | resumed; identical |
+| S4 | Cancel pressed 3 s in | 98/122 checkpoints; 0 destination rows | resumed; identical |
+| S5 | PostgreSQL crash 3 s in | 0 destination rows | resumed; identical |
+| S6 | job killed, then PostgreSQL crash (empties 112 checkpointed unlogged tables) | 0 destination rows | emptied checkpoints recomputed; identical |
+| S7 | job killed, then a new raw row is ingested | stale checkpoints | old job abandoned, fresh run; identical to the original on the new data |
+| S8 | second client starts the same expansion | refused: "still running on the server" | first job finishes; identical |
+| S9 | expansion run again on already expanded tables | original: duplicate key; this code: duplicate key (index rebuild) | both refuse; destinations and versions unchanged |
+
+"Identical" means equal exact fingerprints of all six destination tables (identity values included), the row
+counters, and the version registry (versions and dependencies). Log: [`bench/evidence/recovery_1m_summary.txt`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/evidence/recovery_1m_summary.txt).
+
+## Identity values
+
+Up to 1M rows the output is byte-identical to the original, surrogate keys included. Above a quarter of
+`shared_buffers`, PostgreSQL synchronises sequential scans, so the original's own identity values depend on where
+an earlier scan stopped: two runs of the untouched code on the same data produced the same rows with different
+keys. There this submission assigns keys deterministically in source order and produces identical rows.
+
+## Trade-offs
+
+* Temporary space of about one copy of the output (unlogged staging), released at commit.
+* `raw_data` is `SHARE`-locked during the expansion (writes wait); the original only took a snapshot.
+* Higher peak memory than the single-session original (parallel sessions).
+* If a `raw_data` row is updated in place (raw tables are append-only in the application), its physical position
+  no longer follows `raw_id`; the rows stay identical, but surrogate keys of `table2` / `table5` may then differ
+  from the original's, whose plan reads those tables in `raw_id` order.
+
+## Reproduce
+
+[`bench/server/`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/server/) (test server image), [`bench/headless_expand.py`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/headless_expand.py) (headless Expand with the GUI's report formatter),
+[`bench/fingerprint.sql`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/fingerprint.sql) / [`bench/control_fingerprint.sql`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/control_fingerprint.sql) (output and registry fingerprints),
+[`bench/recovery_suite.sh`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/recovery_suite.sh) (failure scenarios), [`bench/monitor.sh`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/monitor.sh) (resource sampler). `PDM_FAST_EXPAND=0`
+forces the original serial path.
+
+**Quick start** (any PostgreSQL 16 host reachable over SSH; [`bench/server/`](https://github.com/Thebinary110/postgres-expand-optimization/blob/fast-expansion/bench/server/) is the image the numbers above used):
+
+1. Generate the database with the unchanged upstream generator, as described in `GENERATE_DATABASE_README.md`.
+2. Run the headless Expand; credentials come only from the environment:
+   `PDM_SSH_HOST=... PDM_SSH_PORT=... PDM_SSH_USER=... PDM_SSH_PASSWORD=... PDM_PG_PORT=... PDM_PG_USER=... PDM_PG_PASSWORD=... python bench/headless_expand.py --database kaggle_challenge --report fast.txt`
+3. Restore the same snapshot and run the original path for comparison: the same command with `PDM_FAST_EXPAND=0 ... --report original.txt`.
+4. Compare `MEASURED PROCESSING TOTAL` in the two reports, then `psql -f bench/fingerprint.sql` and
+   `psql -f bench/control_fingerprint.sql` on both databases: the fingerprints must match.
+5. `bench/recovery_suite.sh <snapshot> <results dir>` replays the failure scenarios S0-S9 (needs the helper
+   scripts described in its header); `python -m pytest tests/test_fast_expansion.py` runs the unit tests.
